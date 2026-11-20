@@ -26,6 +26,9 @@ pub enum NudeError {
     #[error("identificador no válido para una referencia Git: {0}")]
     InvalidRefComponent(String),
 
+    #[error("{0}")]
+    GitOperation(String),
+
     #[error("no encontrado: {0}")]
     NotFound(String),
 

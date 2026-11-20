@@ -8,7 +8,7 @@
 - **Separación de Responsabilidades:**
   - `src-tauri/src/` (Rust): Único responsable de operaciones de sistema de archivos (`notify`), lectura/escritura de repositorios Git (`git2`), persistencia en SQLite (`rusqlite`) y parsing de logs locales de agentes (`~/.claude`, `~/.codex`, `~/.opencode`).
   - `src/` (React + TypeScript): Capa puramente visual y de estado de UI. Prohibido ejecutar lógica de negocio o parsing pesado en el frontend.
-- **No Ensuciar el Historial Git del Usuario:** Los puntos de restauración automáticos creados por Nude deben almacenarse en referencias internas (`refs/nude/checkpoints/<session_id>/<timestamp>`) o base de datos local, nunca creando commits no solicitados en la rama activa (`main`/`dev`) del usuario.
+- **No Ensuciar el Historial Git del Usuario:** Los puntos de restauración automáticos creados por Nude deben almacenarse en referencias internas (`refs/nude/checkpoints/<session_id>/<timestamp>`) o base de datos local, nunca creando commits no solicitados en la rama activa (`main`/`dev`) del usuario. Las únicas operaciones que tocan `HEAD`, ramas o `.git/index` están en `src-tauri/src/git/branches.rs` y solo se ejecutan cuando el usuario las pide desde la UI.
 
 ## 3. Esquema Base de Datos (SQLite - `nude.db`)
 Ubicación: `~/Library/Application Support/com.nude.app/nude.db`
@@ -23,6 +23,7 @@ Ubicación: `~/Library/Application Support/com.nude.app/nude.db`
   - `src-tauri/src/git/` (diffs, refs internas y rollback quirúrgico)
   - `src-tauri/src/watcher/` (observador de archivos + detector de sesiones de agentes)
   - `src-tauri/src/commands/` (comandos IPC expuestos al frontend)
+  - `src-tauri/src/safety.rs` (alertas de archivos sensibles y bucles de agentes)
 - **Frontend:** Componentes funcionales en TypeScript estricto (`strict: true`), Tailwind CSS, interfaz oscura minimalista estilo macOS nativo.
 
 ## 5. Flujo de Trabajo entre Agentes

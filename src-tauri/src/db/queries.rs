@@ -238,6 +238,79 @@ impl Database {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Sesión (no manual) del checkpoint de agente más reciente del proyecto.
+    pub fn last_agent_session(&self, project_id: &str) -> NudeResult<Option<AgentSession>> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                "SELECT s.id, s.project_id, s.agent_tool, s.model_name, s.external_id,
+                        s.started_at, s.ended_at
+                 FROM checkpoints c JOIN agent_sessions s ON s.id = c.session_id
+                 WHERE c.project_id = ?1 AND s.agent_tool <> 'manual'
+                 ORDER BY c.created_at DESC, c.rowid DESC LIMIT 1",
+                params![project_id],
+                session_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Checkpoints de una sesión, del más antiguo al más reciente.
+    pub fn session_checkpoints(&self, session_id: &str) -> NudeResult<Vec<Checkpoint>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&format!(
+            "{CHECKPOINT_SELECT} WHERE c.session_id = ?1 ORDER BY c.created_at, c.rowid"
+        ))?;
+        let rows = stmt.query_map(params![session_id], checkpoint_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Checkpoint del proyecto inmediatamente anterior a `checkpoint_id`.
+    pub fn checkpoint_before(&self, project_id: &str, checkpoint_id: &str) -> NudeResult<Option<Checkpoint>> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                &format!(
+                    "{CHECKPOINT_SELECT}
+                     WHERE c.project_id = ?1
+                       AND (c.created_at, c.rowid) <
+                           (SELECT created_at, rowid FROM checkpoints WHERE id = ?2)
+                     ORDER BY c.created_at DESC, c.rowid DESC LIMIT 1"
+                ),
+                params![project_id, checkpoint_id],
+                checkpoint_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Para la sesión de `checkpoint_id`: sus checkpoints hasta él (incluido),
+    /// en orden cronológico, con las rutas que tocó cada uno.
+    pub fn session_file_history(&self, checkpoint_id: &str) -> NudeResult<Vec<(String, Vec<String>)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT c.id, f.file_path
+             FROM checkpoints c
+             LEFT JOIN file_diffs f ON f.checkpoint_id = c.id
+             WHERE c.session_id = (SELECT session_id FROM checkpoints WHERE id = ?1)
+               AND (c.created_at, c.rowid) <=
+                   (SELECT created_at, rowid FROM checkpoints WHERE id = ?1)
+             ORDER BY c.created_at, c.rowid, f.file_path",
+        )?;
+        let rows = stmt.query_map(params![checkpoint_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        for row in rows {
+            let (id, path) = row?;
+            if out.last().map(|(last, _)| last != &id).unwrap_or(true) {
+                out.push((id, Vec::new()));
+            }
+            if let (Some(path), Some((_, paths))) = (path, out.last_mut()) {
+                paths.push(path);
+            }
+        }
+        Ok(out)
+    }
+
     /// Registra un checkpoint y sus diffs en una sola transacción.
     /// `git_ref` debe venir de `git::create_snapshot`.
     pub fn insert_checkpoint(

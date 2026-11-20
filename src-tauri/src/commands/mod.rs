@@ -5,9 +5,17 @@
 
 // `generate_handler!` necesita la ruta real del módulo (no un re-export).
 pub mod checkpoints;
+pub mod git;
 pub mod projects;
 
+use crate::db::Database;
+use crate::db::models::Project;
 use crate::error::{NudeError, NudeResult};
+
+fn project_or_404(db: &Database, project_id: &str) -> NudeResult<Project> {
+    db.get_project(project_id)?
+        .ok_or_else(|| NudeError::NotFound(format!("proyecto {project_id}")))
+}
 
 /// Ejecuta `f` en el pool bloqueante de Tauri y aplana el error de join.
 async fn blocking<T, F>(f: F) -> NudeResult<T>

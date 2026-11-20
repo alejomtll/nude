@@ -9,7 +9,11 @@ mod capture;
 mod filter;
 mod sessions;
 
-pub use capture::{RollbackResult, capture_if_changed, create_manual_checkpoint, rollback_to_checkpoint};
+pub use capture::{
+    RollbackResult, UndoAgentPlan, UndoAgentResult, capture_if_changed,
+    create_manual_checkpoint, guarded_change, preview_undo_last_agent, rollback_to_checkpoint,
+    undo_last_agent,
+};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

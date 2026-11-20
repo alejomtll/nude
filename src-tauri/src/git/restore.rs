@@ -17,9 +17,31 @@ use crate::error::{NudeError, NudeResult};
 pub fn restore_working_tree(root: &Path, git_ref: &str) -> NudeResult<usize> {
     let repo = open_worktree(root)?;
     let target = resolve_checkpoint_tree(&repo, git_ref)?;
-    let current = repo.find_tree(snapshot_tree(&repo)?)?;
+    restore_to_tree(&repo, root, &target)
+}
 
-    let diff = repo.diff_tree_to_tree(Some(&current), Some(&target), None)?;
+/// Igual que `restore_working_tree`, pero al árbol del commit **padre** del
+/// checkpoint (el `HEAD` del momento en que se tomó). Lo usa "Deshacer último
+/// agente" cuando la sesión no tiene ningún checkpoint anterior.
+pub fn restore_working_tree_to_base(root: &Path, git_ref: &str) -> NudeResult<usize> {
+    let repo = open_worktree(root)?;
+    resolve_checkpoint_tree(&repo, git_ref)?; // valida el espacio de nombres
+    let commit = repo.find_reference(git_ref)?.peel_to_commit()?;
+    let target = match commit.parent(0) {
+        Ok(parent) => parent.tree()?,
+        Err(_) => {
+            // Snapshot de una rama sin commits: el estado previo era vacío.
+            let empty = repo.treebuilder(None)?.write()?;
+            repo.find_tree(empty)?
+        }
+    };
+    restore_to_tree(&repo, root, &target)
+}
+
+fn restore_to_tree(repo: &Repository, root: &Path, target: &git2::Tree<'_>) -> NudeResult<usize> {
+    let current = repo.find_tree(snapshot_tree(repo)?)?;
+
+    let diff = repo.diff_tree_to_tree(Some(&current), Some(target), None)?;
     let mut touched = 0usize;
 
     // 1) Borrados primero: así un fichero que pasa a ser directorio (o al revés)
@@ -43,7 +65,7 @@ pub fn restore_working_tree(root: &Path, git_ref: &str) -> NudeResult<usize> {
             _ => {
                 let new = delta.new_file();
                 let path = safe_join(root, new.path())?;
-                write_entry(&repo, root, &path, new.id(), new.mode())?;
+                write_entry(repo, root, &path, new.id(), new.mode())?;
                 touched += 1;
             }
         }

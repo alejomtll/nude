@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
-import { FileCode2, FileDiff as FileDiffIcon } from "lucide-react";
+import { FileCode2, FileDiff as FileDiffIcon, KeyRound, Repeat2, TriangleExclamationPoint } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { errorMessage, fileCount, type FileDiff, type Resource } from "./workspace";
+import { errorMessage, fileCount, type FileAlert, type FileDiff, type Resource } from "./workspace";
 
 const changes = {
   added: { label: "Agregado", marker: "A" },
@@ -42,8 +42,52 @@ function UnifiedPatch({ patch }: { patch: string }) {
   );
 }
 
+const categoryLabel: Record<NonNullable<FileAlert["category"]>, string> = {
+  secrets: "Secretos",
+  dependencies: "Dependencias",
+  migrations: "Migración",
+  deployment: "Despliegue",
+};
+
+function AlertIcon({ alert }: { alert: FileAlert }) {
+  if (alert.kind === "loop") return <Repeat2 size={12} aria-hidden="true" />;
+  if (alert.category === "secrets") return <KeyRound size={12} aria-hidden="true" />;
+  return <TriangleExclamationPoint size={12} aria-hidden="true" />;
+}
+
+function AlertBadge({ alert }: { alert: FileAlert }) {
+  const label = alert.kind === "loop" ? `Bucle ×${alert.editStreak ?? "?"}` : categoryLabel[alert.category ?? "deployment"];
+  return (
+    <span className="alert-badge" data-kind={alert.kind} title={alert.message}>
+      <AlertIcon alert={alert} />{label}
+    </span>
+  );
+}
+
+function AlertSummary({ alerts }: { alerts: FileAlert[] }) {
+  const sensitive = alerts.filter((a) => a.kind === "sensitive");
+  const loops = alerts.filter((a) => a.kind === "loop");
+  return (
+    <div className="alert-summary" role="note" aria-label="Avisos de seguridad">
+      {sensitive.length > 0 && (
+        <p>
+          <TriangleExclamationPoint size={14} aria-hidden="true" className="shrink-0" />
+          <span><strong>Archivos sensibles:</strong> {sensitive.map((a) => a.filePath).join(", ")}. Revísalos antes de seguir.</span>
+        </p>
+      )}
+      {loops.length > 0 && (
+        <p data-kind="loop">
+          <Repeat2 size={14} aria-hidden="true" className="shrink-0" />
+          <span><strong>Posible bucle:</strong> {loops.map((a) => `${a.filePath} (${a.editStreak} veces seguidas)`).join(", ")}. Si el agente no avanza, detenlo o deshaz la sesión.</span>
+        </p>
+      )}
+    </div>
+  );
+}
+
 function CheckpointDiffs({ checkpointId }: { checkpointId: string }) {
   const [resource, setResource] = useState<Resource<FileDiff[]>>({});
+  const [alerts, setAlerts] = useState<FileAlert[]>([]);
   const [selected, setSelected] = useState<number>(0);
   const [attempt, setAttempt] = useState(0);
 
@@ -52,6 +96,11 @@ function CheckpointDiffs({ checkpointId }: { checkpointId: string }) {
     invoke<FileDiff[]>("get_checkpoint_diffs", { checkpointId }).then(
       (data) => { if (active) setResource({ data }); },
       (error: unknown) => { if (active) setResource({ error: errorMessage(error) }); },
+    );
+    // Los avisos son complementarios: si fallan, el inspector sigue funcionando.
+    invoke<FileAlert[]>("get_checkpoint_alerts", { checkpointId }).then(
+      (data) => { if (active) setAlerts(data); },
+      () => { if (active) setAlerts([]); },
     );
     return () => { active = false; };
   }, [checkpointId, attempt]);
@@ -72,8 +121,13 @@ function CheckpointDiffs({ checkpointId }: { checkpointId: string }) {
   const file = files[selected];
   if (!file) return <div className="empty-state">Este checkpoint no tiene cambios de archivos.</div>;
 
+  const alertsByFile = new Map<string, FileAlert[]>();
+  for (const alert of alerts) alertsByFile.set(alert.filePath, [...(alertsByFile.get(alert.filePath) ?? []), alert]);
+  const fileAlerts = alertsByFile.get(file.filePath) ?? [];
+
   return (
     <>
+      {alerts.length > 0 && <AlertSummary alerts={alerts} />}
       <div className="file-list">
         <div className="section-label px-2 pb-1">{fileCount(files.length)}</div>
         <ul aria-label="Archivos cambiados">
@@ -83,13 +137,18 @@ function CheckpointDiffs({ checkpointId }: { checkpointId: string }) {
                 className="file-row"
                 title={`${changes[item.changeType].label} · ${item.filePath}`}
                 aria-pressed={index === selected}
-                aria-label={`${item.filePath}, ${changes[item.changeType].label}`}
+                aria-label={`${item.filePath}, ${changes[item.changeType].label}${alertsByFile.has(item.filePath) ? ", con aviso" : ""}`}
                 onClick={() => setSelected(index)}
               >
                 <span className={`file-status ${item.changeType}`} aria-hidden="true">
                   {changes[item.changeType].marker}
                 </span>
-                <span className="min-w-0 truncate" dir="auto">{item.filePath}</span>
+                <span className="min-w-0 flex-1 truncate" dir="auto">{item.filePath}</span>
+                {alertsByFile.get(item.filePath)?.map((alert) => (
+                  <span key={alert.kind} className="alert-dot" data-kind={alert.kind} title={alert.message}>
+                    <AlertIcon alert={alert} />
+                  </span>
+                ))}
               </button>
             </li>
           ))}
@@ -97,7 +156,8 @@ function CheckpointDiffs({ checkpointId }: { checkpointId: string }) {
       </div>
       <div className="patch-header">
         <FileCode2 size={15} aria-hidden="true" className="shrink-0" />
-        <span className="min-w-0 truncate" title={file.filePath}>{file.filePath}</span>
+        <span className="min-w-0 flex-1 truncate" title={file.filePath}>{file.filePath}</span>
+        {fileAlerts.map((alert) => <AlertBadge key={alert.kind} alert={alert} />)}
       </div>
       {file.patchText ? (
         <UnifiedPatch key={selected} patch={file.patchText} />

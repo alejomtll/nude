@@ -2,6 +2,7 @@ mod commands;
 mod db;
 mod error;
 mod git;
+mod safety;
 mod watcher;
 
 use tauri::{Emitter, Manager};
@@ -10,6 +11,7 @@ use tauri::{Emitter, Manager};
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // ~/Library/Application Support/com.nude.app/nude.db
             let data_dir = app.path().app_data_dir()?;
@@ -38,6 +40,13 @@ pub fn run() {
             commands::checkpoints::create_manual_checkpoint,
             commands::checkpoints::get_checkpoint_diffs,
             commands::checkpoints::rollback_checkpoint,
+            commands::checkpoints::get_checkpoint_alerts,
+            commands::checkpoints::preview_undo_last_agent,
+            commands::checkpoints::undo_last_agent,
+            commands::git::get_git_graph,
+            commands::git::git_create_branch,
+            commands::git::git_checkout_branch,
+            commands::git::git_quick_commit,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

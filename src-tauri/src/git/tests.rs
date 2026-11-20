@@ -279,3 +279,164 @@ fn tree_ids_detect_real_changes_only() {
     assert_eq!(second.files.len(), 1, "{:?}", second.files);
     assert_eq!(second.files[0].file_path, "other.txt");
 }
+
+// ------------------------------------------------------------ Fase 4: grafo
+
+fn commit_all(repo: &Repository, message: &str) -> git2::Oid {
+    let mut index = repo.index().expect("index");
+    index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None).expect("add");
+    index.update_all(["*"].iter(), None).expect("update");
+    index.write().expect("write");
+    let tree = repo.find_tree(index.write_tree().expect("tree")).expect("find");
+    let sig = Signature::now("Test", "test@example.com").expect("sig");
+    let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+    let parents: Vec<_> = parent.iter().collect();
+    repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents).expect("commit")
+}
+
+fn set_identity(repo: &Repository) {
+    let mut cfg = repo.config().expect("cfg");
+    cfg.set_str("user.name", "Test").expect("name");
+    cfg.set_str("user.email", "test@example.com").expect("email");
+}
+
+#[test]
+fn history_lists_branches_commits_parents_and_status() {
+    let (dir, repo) = repo_with_commit();
+    let first = repo.head().expect("h").target().expect("oid");
+    create_branch(dir.path(), "feature/x", None, true).expect("branch");
+    write(dir.path(), "feature.txt", "f\n");
+    let second = commit_all(&repo, "feature commit");
+
+    write(dir.path(), "tracked.txt", "staged\n");
+    let mut index = repo.index().expect("index");
+    index.add_path(Path::new("tracked.txt")).expect("stage");
+    index.write().expect("write");
+    write(dir.path(), "untracked.md", "u\n");
+
+    let history = read_history(dir.path(), GRAPH_COMMIT_LIMIT).expect("history");
+    assert_eq!(history.head.branch.as_deref(), Some("feature/x"));
+    assert_eq!(history.head.commit_id, Some(second.to_string()));
+    let names: Vec<_> = history.branches.iter().map(|b| b.name.as_str()).collect();
+    assert_eq!(names[0], "feature/x", "la rama actual va primero");
+    assert_eq!(history.branches.len(), 2);
+    assert_eq!(history.commits.len(), 2);
+    assert_eq!(history.commits[0].id, second.to_string());
+    assert_eq!(history.commits[0].parent_ids, vec![first.to_string()]);
+    assert_eq!(history.commits[0].summary, "feature commit");
+    assert_eq!(history.commits[0].author_name, "Test");
+    assert!(history.status.staged.iter().any(|e| e.path == "tracked.txt"));
+    assert!(history.status.unstaged.iter().any(|e| e.path == "untracked.md"));
+    assert!(history.operation.is_none());
+}
+
+#[test]
+fn history_of_unborn_repo_is_empty() {
+    let dir = TempDir::new();
+    Repository::init(dir.path()).expect("init");
+    write(dir.path(), "a.txt", "a");
+    let history = read_history(dir.path(), 50).expect("history");
+    assert!(history.head.unborn);
+    assert!(history.commits.is_empty());
+    assert_eq!(history.status.unstaged.len(), 1);
+}
+
+#[test]
+fn checkout_is_safe_and_switches_head() {
+    let (dir, repo) = repo_with_commit();
+    let main = repo.head().expect("h").shorthand().expect("name").to_owned();
+    create_branch(dir.path(), "prueba", None, false).expect("branch");
+    assert_eq!(repo.head().expect("h").shorthand().ok(), Some(main.as_str()), "sin checkout");
+
+    checkout_branch(dir.path(), "prueba").expect("checkout");
+    write(dir.path(), "tracked.txt", "en prueba\n");
+    commit_all(&repo, "cambio en prueba");
+
+    // Cambio local que chocaría con la otra rama → error y nada se toca.
+    write(dir.path(), "tracked.txt", "local sin guardar\n");
+    let err = checkout_branch(dir.path(), &main).expect_err("debe negarse");
+    assert!(err.to_string().contains("cambios sin commit"), "{err}");
+    assert_eq!(fs::read_to_string(dir.path().join("tracked.txt")).expect("r"), "local sin guardar\n");
+    assert_eq!(repo.head().expect("h").shorthand().ok(), Some("prueba"));
+
+    // Un cambio que no choca se conserva al cambiar.
+    write(dir.path(), "tracked.txt", "en prueba\n");
+    write(dir.path(), "notas.md", "wip\n");
+    checkout_branch(dir.path(), &main).expect("checkout main");
+    let repo = Repository::open(dir.path()).expect("reopen");
+    assert_eq!(repo.head().expect("h").shorthand().ok(), Some(main.as_str()));
+    assert_eq!(fs::read_to_string(dir.path().join("tracked.txt")).expect("r"), "v1\n");
+    assert!(dir.path().join("notas.md").exists());
+}
+
+#[test]
+fn create_branch_rejects_bad_or_duplicate_names() {
+    let (dir, _repo) = repo_with_commit();
+    for bad in ["", "con espacio", "a..b", "-x", "x.lock", "a~b"] {
+        assert!(create_branch(dir.path(), bad, None, false).is_err(), "aceptó {bad:?}");
+    }
+    create_branch(dir.path(), "ok", None, false).expect("ok");
+    assert!(create_branch(dir.path(), "ok", None, false).is_err());
+}
+
+#[test]
+fn quick_commit_includes_only_selected_files() {
+    let (dir, repo) = repo_with_commit();
+    set_identity(&repo);
+    write(dir.path(), "tracked.txt", "v2\n");
+    write(dir.path(), "other.txt", "no elegido\n");
+    fs::remove_file(dir.path().join("gone.txt")).expect("rm");
+    // Algo preparado de antes que no se elige: debe seguir preparado.
+    write(dir.path(), "staged-before.txt", "s\n");
+    let mut index = repo.index().expect("index");
+    index.add_path(Path::new("staged-before.txt")).expect("stage");
+    index.write().expect("write");
+
+    let result = quick_commit(
+        dir.path(),
+        "Cambio visual",
+        &["tracked.txt".into(), "gone.txt".into()],
+    )
+    .expect("commit");
+    assert_eq!(result.files_committed, 2);
+
+    let repo = Repository::open(dir.path()).expect("reopen");
+    let head = repo.head().expect("h").peel_to_commit().expect("c");
+    assert_eq!(head.id().to_string(), result.commit_id);
+    assert_eq!(head.summary().ok().flatten(), Some("Cambio visual"));
+    let tree = head.tree().expect("tree");
+    assert!(tree.get_path(Path::new("gone.txt")).is_err());
+    assert!(tree.get_path(Path::new("other.txt")).is_err());
+    assert!(tree.get_path(Path::new("staged-before.txt")).is_err());
+
+    let history = read_history(dir.path(), 50).expect("h");
+    let staged: Vec<_> = history.status.staged.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(staged, vec!["staged-before.txt"]);
+    assert!(history.status.unstaged.iter().any(|e| e.path == "other.txt"));
+    assert!(!history.status.unstaged.iter().any(|e| e.path == "tracked.txt"));
+}
+
+#[test]
+fn quick_commit_validates_input() {
+    let (dir, repo) = repo_with_commit();
+    set_identity(&repo);
+    assert!(quick_commit(dir.path(), "  ", &["tracked.txt".into()]).is_err());
+    assert!(quick_commit(dir.path(), "m", &[]).is_err());
+    assert!(quick_commit(dir.path(), "m", &["../fuera".into()]).is_err());
+    assert!(quick_commit(dir.path(), "m", &[".git/config".into()]).is_err());
+    assert!(quick_commit(dir.path(), "m", &["tracked.txt".into()]).is_err(), "sin cambios");
+}
+
+#[test]
+fn restore_to_base_returns_to_head_of_snapshot_time() {
+    let (dir, _repo) = repo_with_commit();
+    write(dir.path(), "tracked.txt", "agente\n");
+    write(dir.path(), "nuevo.rs", "x\n");
+    let snap = create_snapshot(dir.path(), "s1", "agente", None).expect("snap");
+    assert!(checkpoint_base_commit(dir.path(), &snap.git_ref).expect("base").is_some());
+
+    restore_working_tree_to_base(dir.path(), &snap.git_ref).expect("restore");
+    assert_eq!(fs::read_to_string(dir.path().join("tracked.txt")).expect("r"), "v1\n");
+    assert!(!dir.path().join("nuevo.rs").exists());
+    assert_eq!(working_tree_id(dir.path()).expect("w"), head_tree_id(dir.path()).expect("h").expect("s"));
+}

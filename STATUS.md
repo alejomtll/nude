@@ -1,7 +1,7 @@
 # Estado del proyecto Nude
 
 > Checklist vivo. Cada agente lo actualiza al terminar una tarea (ver AGENTS.md §5).
-> Última actualización: 2026-11-20 — Fase 3, interfaz de escritorio.
+> Última actualización: 2026-11-20 — Fase 4 (grafo Git, selector nativo y asistente de seguridad).
 
 ## Fase 1 — Backend base (Rust) ✅
 
@@ -84,3 +84,42 @@
 - [x] 29 pruebas Rust aprobadas, incluidas la baja del watcher, la captura manual y la preservación de archivos ignorados durante un rollback.
 - [x] Prueba en la app Tauri empaquetada con SQLite temporal. Se verificó el alta por ruta y la suscripción del timeline.
 - [ ] Completar la prueba visual de captura manual, inspector, rollback y baja en la app abierta. El backend de esos flujos pasó las pruebas Rust.
+
+## Fase 4 — Herramienta visual para devs nuevos y vibe coders ✅
+
+### Selector nativo y empaquetado macOS
+- [x] `tauri-plugin-dialog` (Rust) + `@tauri-apps/plugin-dialog` (npm); permiso `dialog:allow-open` en `capabilities/default.json`
+- [x] "Agregar proyecto" (`+` y estado vacío) abre el selector de carpetas de Finder; se mantiene "Pegar ruta" (icono junto al `+` y dentro del diálogo, que también tiene "Elegir carpeta en Finder…"). Si el selector falla, cae al diálogo de ruta
+- [x] `tauri.conf.json`: iconos verificados en `src-tauri/icons/` (32, 128, 256 px, `icon.icns`, `icon.ico`); `category: DeveloperTool`, `macOS.minimumSystemVersion: 11.0`
+
+### Grafo Git — backend (`src-tauri/src/git/`)
+- [x] `history.rs` (solo lectura): `read_history` → `HEAD` (rama/separado/sin commits), ramas locales con upstream, últimos 50 commits de todas las ramas en orden topológico con `parentIds`, autor, fecha y mensaje, y estado `staged`/`unstaged`/`conflicted`; detecta merge/rebase en curso
+- [x] `branches.rs` (acciones explícitas del usuario, nunca automáticas):
+  - `create_branch` valida el nombre y que no exista; desde `HEAD` o desde un commit
+  - `checkout_branch` es seguro (como `git switch`): conserva cambios locales que no chocan y, si alguno chocaría, falla sin tocar nada
+  - `quick_commit` hace commit con **exactamente** los archivos elegidos (árbol = `HEAD` + selección); lo ya preparado y no elegido sigue preparado. Pide `user.name`/`user.email` si faltan
+  - Todo se niega durante un merge/rebase en curso
+- [x] `restore_working_tree_to_base`, `checkpoint_base_commit(s)`, `checkpoint_base_tree_id`
+- [x] Comandos (`commands/git.rs`): `get_git_graph({ projectId })` (historial + checkpoints anclados a su commit base), `git_create_branch({ projectId, name, fromCommit?, checkout })`, `git_checkout_branch({ projectId, name })`, `git_quick_commit({ projectId, message, paths })`
+- [x] Crear+cambiar y cambiar de rama van envueltos en `watcher::guarded_change`: checkpoint `manual` antes y después, bajo `CAPTURE_LOCK`, para que nada se pierda ni se atribuya al agente activo
+
+### Grafo Git — frontend
+- [x] Barra superior con conmutador **Timeline de Agentes / Grafo Git**
+- [x] `src/GitGraphView.tsx`: grafo SVG estilo metro (carriles por rama, diagonales en bifurcaciones y fusiones, anillo en `HEAD`, nodo discontinuo "Cambios sin commit"), etiquetas de rama (clic = cambiar), chips de checkpoints de Nude por commit (clic = abre ese checkpoint en el timeline) y botón "Crear rama aquí" por commit
+- [x] Panel lateral: ramas locales con "Cambiar", lista de cambios con casillas y commit visual; botón "Rama de prueba" (nombre sugerido `prueba/agente-MMDD-HHmm`)
+- [x] Se refresca al crearse checkpoints y al recuperar el foco de la ventana (por si se usó la terminal)
+
+### Asistente de seguridad
+- [x] **Deshacer último agente** (cabecera): `preview_undo_last_agent` / `undo_last_agent({ projectId })` vuelve al checkpoint inmediatamente anterior a la primera captura de la última sesión de IA; si no existe, al commit base sobre el que empezó. Guarda antes un checkpoint de seguridad (reversible), los checkpoints que genera son `manual` y el botón se desactiva si ya está deshecho
+- [x] **Alertas** (`src-tauri/src/safety.rs`, comando `get_checkpoint_alerts({ checkpointId })`): archivos sensibles (secretos `.env*`/claves; dependencias `Cargo.toml`, `package.json`, lockfiles…; migraciones; despliegue/CI) y bucles (mismo archivo en más de 4 checkpoints seguidos de la misma sesión). El inspector muestra un resumen arriba, un icono en cada archivo afectado y una insignia junto al parche
+
+### Verificación
+- [x] `cargo check --manifest-path src-tauri/Cargo.toml` sin errores ni avisos
+- [x] `cargo test --lib` — 43 tests (historial, ramas, checkout seguro con y sin conflicto, commit selectivo, restore al commit base, deshacer agente con/sin checkpoint previo e idempotente, alertas sensibles y de bucle)
+- [x] `npm run build` sin errores
+- [x] UI revisada en navegador con el IPC simulado (grafo con fusión y rama sin fusionar, diálogos de rama y de deshacer, alertas del inspector, chip → timeline)
+- [ ] Probar en la app Tauri real: selector de Finder, checkout/commit sobre un repo de verdad y "Deshacer último agente" con una sesión real
+
+### Notas
+- El grafo muestra los últimos 50 commits; las líneas que siguen más allá llegan al borde inferior.
+- Los cambios hechos con Git desde la terminal no generan eventos (el watcher ignora `.git/`): el grafo se actualiza al volver el foco a la ventana o con el botón de refrescar.
