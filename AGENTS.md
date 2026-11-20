@@ -13,7 +13,7 @@
 ## 3. Esquema Base de Datos (SQLite - `nude.db`)
 Ubicación: `~/Library/Application Support/com.nude.app/nude.db`
 - `projects`: `id`, `name`, `root_path` (UNIQUE), `created_at`
-- `agent_sessions`: `id`, `project_id`, `agent_tool` (`claude-code` | `codex` | `opencode` | `manual`), `model_name`, `started_at`, `ended_at`
+- `agent_sessions`: `id`, `project_id`, `agent_tool` (`claude-code` | `codex` | `opencode` | `manual`), `model_name`, `external_id` (id de la sesión en el historial del agente; migración v2), `started_at`, `ended_at`
 - `checkpoints`: `id`, `session_id`, `project_id`, `git_ref`, `prompt_summary`, `files_changed_count`, `created_at`
 - `file_diffs`: `id`, `checkpoint_id`, `file_path`, `change_type` (`added` | `modified` | `deleted`), `patch_text`
 

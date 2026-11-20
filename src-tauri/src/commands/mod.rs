@@ -4,6 +4,7 @@
 //! `spawn_blocking` para no congelar el hilo principal de la UI.
 
 // `generate_handler!` necesita la ruta real del módulo (no un re-export).
+pub mod checkpoints;
 pub mod projects;
 
 use crate::error::{NudeError, NudeResult};

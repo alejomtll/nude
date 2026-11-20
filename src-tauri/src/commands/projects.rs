@@ -8,6 +8,7 @@ use crate::db::Database;
 use crate::db::models::{Checkpoint, Project};
 use crate::error::{NudeError, NudeResult};
 use crate::git;
+use crate::watcher::WatcherHandle;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,11 +21,18 @@ pub struct AddProjectResponse {
 /// Registra un repositorio Git existente. Acepta cualquier ruta dentro del
 /// repo; se guarda la raíz canónica. Idempotente por `root_path`.
 #[tauri::command]
-pub async fn add_project(db: State<'_, Database>, path: String) -> NudeResult<AddProjectResponse> {
+pub async fn add_project(
+    db: State<'_, Database>,
+    watcher: State<'_, WatcherHandle>,
+    path: String,
+) -> NudeResult<AddProjectResponse> {
     let db = db.inner().clone();
+    let watcher = watcher.inner().clone();
     blocking(move || {
         let info = git::register_repository(&PathBuf::from(path))?;
         let (project, created) = db.upsert_project(&info.name, &info.root_path)?;
+        // Idempotente: si ya se vigilaba, el watcher lo ignora.
+        watcher.watch(project.clone());
         Ok(AddProjectResponse { project, created })
     })
     .await
@@ -34,6 +42,17 @@ pub async fn add_project(db: State<'_, Database>, path: String) -> NudeResult<Ad
 pub async fn list_projects(db: State<'_, Database>) -> NudeResult<Vec<Project>> {
     let db = db.inner().clone();
     blocking(move || db.list_projects()).await
+}
+
+#[tauri::command]
+pub async fn remove_project(
+    db: State<'_, Database>,
+    watcher: State<'_, WatcherHandle>,
+    project_id: String,
+) -> NudeResult<()> {
+    let db = db.inner().clone();
+    let watcher = watcher.inner().clone();
+    blocking(move || watcher.remove_project(&db, project_id)).await
 }
 
 /// Checkpoints del proyecto, del más reciente al más antiguo.

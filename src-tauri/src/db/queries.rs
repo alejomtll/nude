@@ -3,8 +3,14 @@
 use rusqlite::{OptionalExtension, Row, params};
 
 use super::Database;
-use super::models::{AgentSession, AgentTool, Checkpoint, FileDiff, Project, new_id, now_rfc3339};
+use super::models::{
+    AgentSession, AgentTool, ChangeType, Checkpoint, FileDiff, Project, new_id, now_rfc3339,
+};
 use crate::error::{NudeError, NudeResult};
+
+const CHECKPOINT_SELECT: &str =
+    "SELECT c.*, s.agent_tool, s.model_name
+     FROM checkpoints c JOIN agent_sessions s ON s.id = c.session_id";
 
 fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
@@ -15,11 +21,25 @@ fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
     })
 }
 
+fn session_from_row(row: &Row<'_>) -> rusqlite::Result<AgentSession> {
+    Ok(AgentSession {
+        id: row.get("id")?,
+        project_id: row.get("project_id")?,
+        agent_tool: row.get("agent_tool")?,
+        model_name: row.get("model_name")?,
+        external_id: row.get("external_id")?,
+        started_at: row.get("started_at")?,
+        ended_at: row.get("ended_at")?,
+    })
+}
+
 fn checkpoint_from_row(row: &Row<'_>) -> rusqlite::Result<Checkpoint> {
     Ok(Checkpoint {
         id: row.get("id")?,
         session_id: row.get("session_id")?,
         project_id: row.get("project_id")?,
+        agent_tool: row.get("agent_tool")?,
+        model_name: row.get("model_name")?,
         git_ref: row.get("git_ref")?,
         prompt_summary: row.get("prompt_summary")?,
         files_changed_count: row.get("files_changed_count")?,
@@ -69,36 +89,92 @@ impl Database {
             .optional()?)
     }
 
+    pub fn delete_project(&self, project_id: &str) -> NudeResult<()> {
+        let conn = self.lock()?;
+        conn.execute("DELETE FROM projects WHERE id = ?1", params![project_id])?;
+        Ok(())
+    }
+
     // ---------------------------------------------------------- agent_sessions
 
-    /// Abre una sesión de agente. Lo usará el detector de sesiones (Fase 2).
-    #[allow(dead_code)]
-    pub fn create_session(
+    /// Devuelve la sesión abierta que corresponde a `(agent_tool, external_id)`
+    /// o la crea. Al crear una nueva se cierran las demás sesiones abiertas del
+    /// proyecto. `external_id = None` ⇒ sesión `manual` (se reutiliza la abierta).
+    pub fn get_or_create_session(
         &self,
         project_id: &str,
         agent_tool: AgentTool,
+        external_id: Option<&str>,
         model_name: Option<&str>,
     ) -> NudeResult<AgentSession> {
-        let session = AgentSession {
-            id: new_id(),
-            project_id: project_id.to_owned(),
-            agent_tool: agent_tool.as_str().to_owned(),
-            model_name: model_name.map(str::to_owned),
-            started_at: now_rfc3339(),
-            ended_at: None,
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+
+        let existing = tx
+            .query_row(
+                "SELECT id, project_id, agent_tool, model_name, external_id, started_at, ended_at
+                 FROM agent_sessions
+                 WHERE project_id = ?1 AND agent_tool = ?2
+                   AND ((?3 IS NULL AND external_id IS NULL AND ended_at IS NULL) OR external_id = ?3)
+                 ORDER BY started_at DESC LIMIT 1",
+                params![project_id, agent_tool.as_str(), external_id],
+                session_from_row,
+            )
+            .optional()?;
+
+        let session = match existing {
+            Some(mut session) => {
+                let mut changed = false;
+                if let Some(model) = model_name {
+                    if session.model_name.as_deref() != Some(model) {
+                        session.model_name = Some(model.to_owned());
+                        changed = true;
+                    }
+                }
+                // Una sesión externa reactivada deja de estar cerrada.
+                if external_id.is_some() && session.ended_at.is_some() {
+                    session.ended_at = None;
+                    changed = true;
+                }
+                if changed {
+                    tx.execute(
+                        "UPDATE agent_sessions SET model_name = ?2, ended_at = ?3 WHERE id = ?1",
+                        params![session.id, session.model_name, session.ended_at],
+                    )?;
+                }
+                session
+            }
+            None => {
+                let session = AgentSession {
+                    id: new_id(),
+                    project_id: project_id.to_owned(),
+                    agent_tool: agent_tool.as_str().to_owned(),
+                    model_name: model_name.map(str::to_owned),
+                    external_id: external_id.map(str::to_owned),
+                    started_at: now_rfc3339(),
+                    ended_at: None,
+                };
+                tx.execute(
+                    "UPDATE agent_sessions SET ended_at = ?2 WHERE project_id = ?1 AND ended_at IS NULL",
+                    params![project_id, session.started_at],
+                )?;
+                tx.execute(
+                    "INSERT INTO agent_sessions
+                        (id, project_id, agent_tool, model_name, external_id, started_at, ended_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+                    params![
+                        session.id,
+                        session.project_id,
+                        session.agent_tool,
+                        session.model_name,
+                        session.external_id,
+                        session.started_at
+                    ],
+                )?;
+                session
+            }
         };
-        let conn = self.lock()?;
-        conn.execute(
-            "INSERT INTO agent_sessions (id, project_id, agent_tool, model_name, started_at, ended_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
-            params![
-                session.id,
-                session.project_id,
-                session.agent_tool,
-                session.model_name,
-                session.started_at
-            ],
-        )?;
+        tx.commit()?;
         Ok(session)
     }
 
@@ -107,20 +183,63 @@ impl Database {
     /// Checkpoints de un proyecto, del más reciente al más antiguo.
     pub fn list_checkpoints(&self, project_id: &str) -> NudeResult<Vec<Checkpoint>> {
         let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, session_id, project_id, git_ref, prompt_summary,
-                    files_changed_count, created_at
-             FROM checkpoints
-             WHERE project_id = ?1
-             ORDER BY created_at DESC, rowid DESC",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "{CHECKPOINT_SELECT} WHERE c.project_id = ?1
+             ORDER BY c.created_at DESC, c.rowid DESC"
+        ))?;
         let rows = stmt.query_map(params![project_id], checkpoint_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn get_checkpoint(&self, checkpoint_id: &str) -> NudeResult<Option<Checkpoint>> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                &format!("{CHECKPOINT_SELECT} WHERE c.id = ?1"),
+                params![checkpoint_id],
+                checkpoint_from_row,
+            )
+            .optional()?)
+    }
+
+    pub fn latest_checkpoint(&self, project_id: &str) -> NudeResult<Option<Checkpoint>> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                &format!(
+                    "{CHECKPOINT_SELECT} WHERE c.project_id = ?1
+                     ORDER BY c.created_at DESC, c.rowid DESC LIMIT 1"
+                ),
+                params![project_id],
+                checkpoint_from_row,
+            )
+            .optional()?)
+    }
+
+    pub fn list_file_diffs(&self, checkpoint_id: &str) -> NudeResult<Vec<FileDiff>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT file_path, change_type, patch_text FROM file_diffs
+             WHERE checkpoint_id = ?1 ORDER BY file_path",
+        )?;
+        let rows = stmt.query_map(params![checkpoint_id], |row| {
+            let change: String = row.get("change_type")?;
+            let change_type = match change.as_str() {
+                "added" => ChangeType::Added,
+                "deleted" => ChangeType::Deleted,
+                _ => ChangeType::Modified,
+            };
+            Ok(FileDiff {
+                file_path: row.get("file_path")?,
+                change_type,
+                patch_text: row.get("patch_text")?,
+            })
+        })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Registra un checkpoint y sus diffs en una sola transacción.
     /// `git_ref` debe venir de `git::create_snapshot`.
-    #[allow(dead_code)]
     pub fn insert_checkpoint(
         &self,
         session_id: &str,
@@ -129,16 +248,9 @@ impl Database {
         prompt_summary: Option<&str>,
         diffs: &[FileDiff],
     ) -> NudeResult<Checkpoint> {
-        let checkpoint = Checkpoint {
-            id: new_id(),
-            session_id: session_id.to_owned(),
-            project_id: project_id.to_owned(),
-            git_ref: git_ref.to_owned(),
-            prompt_summary: prompt_summary.map(str::to_owned),
-            files_changed_count: i64::try_from(diffs.len())
-                .map_err(|_| NudeError::Task("demasiados ficheros en el diff".into()))?,
-            created_at: now_rfc3339(),
-        };
+        let checkpoint_id = new_id();
+        let files_changed_count = i64::try_from(diffs.len())
+            .map_err(|_| NudeError::Task("demasiados ficheros en el diff".into()))?;
 
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
@@ -147,13 +259,13 @@ impl Database {
                 (id, session_id, project_id, git_ref, prompt_summary, files_changed_count, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
-                checkpoint.id,
-                checkpoint.session_id,
-                checkpoint.project_id,
-                checkpoint.git_ref,
-                checkpoint.prompt_summary,
-                checkpoint.files_changed_count,
-                checkpoint.created_at
+                checkpoint_id,
+                session_id,
+                project_id,
+                git_ref,
+                prompt_summary,
+                files_changed_count,
+                now_rfc3339()
             ],
         )?;
         {
@@ -163,13 +275,18 @@ impl Database {
             )?;
             for diff in diffs {
                 stmt.execute(params![
-                    checkpoint.id,
+                    checkpoint_id,
                     diff.file_path,
                     diff.change_type.as_str(),
                     diff.patch_text
                 ])?;
             }
         }
+        let checkpoint = tx.query_row(
+            &format!("{CHECKPOINT_SELECT} WHERE c.id = ?1"),
+            params![checkpoint_id],
+            checkpoint_from_row,
+        )?;
         tx.commit()?;
         Ok(checkpoint)
     }
@@ -225,7 +342,7 @@ mod tests {
         let db = Database::open_in_memory().expect("db");
         let (project, _) = db.upsert_project("demo", "/tmp/demo").expect("project");
         let session = db
-            .create_session(&project.id, AgentTool::ClaudeCode, Some("claude-opus-5-5"))
+            .get_or_create_session(&project.id, AgentTool::ClaudeCode, Some("abc"), Some("claude-opus-5-5"))
             .expect("session");
 
         let diffs = vec![
@@ -250,6 +367,8 @@ mod tests {
 
         let listed = db.list_checkpoints(&project.id).expect("list");
         assert_eq!(listed, vec![second, first.clone()]);
+        assert_eq!(first.agent_tool, "claude-code");
+        assert_eq!(first.model_name.as_deref(), Some("claude-opus-5-5"));
         assert_eq!(first.files_changed_count, 2);
 
         let conn = db.lock().expect("lock");
@@ -261,6 +380,36 @@ mod tests {
             )
             .expect("count");
         assert_eq!(stored, 2);
+    }
+
+    #[test]
+    fn sessions_are_reused_by_external_id_and_previous_ones_closed() {
+        let db = Database::open_in_memory().expect("db");
+        let (project, _) = db.upsert_project("demo", "/tmp/demo").expect("project");
+
+        let manual = db
+            .get_or_create_session(&project.id, AgentTool::Manual, None, None)
+            .expect("manual");
+        let manual_again = db
+            .get_or_create_session(&project.id, AgentTool::Manual, None, None)
+            .expect("manual 2");
+        assert_eq!(manual.id, manual_again.id);
+
+        let claude = db
+            .get_or_create_session(&project.id, AgentTool::ClaudeCode, Some("s1"), Some("opus"))
+            .expect("claude");
+        assert_ne!(claude.id, manual.id);
+        let claude_again = db
+            .get_or_create_session(&project.id, AgentTool::ClaudeCode, Some("s1"), Some("sonnet"))
+            .expect("claude 2");
+        assert_eq!(claude_again.id, claude.id);
+        assert_eq!(claude_again.model_name.as_deref(), Some("sonnet"));
+
+        // La sesión manual se cerró al llegar la del agente: la siguiente manual es otra.
+        let manual_new = db
+            .get_or_create_session(&project.id, AgentTool::Manual, None, None)
+            .expect("manual 3");
+        assert_ne!(manual_new.id, manual.id);
     }
 
     #[test]

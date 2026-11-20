@@ -30,7 +30,15 @@ pub struct Snapshot {
 /// - No escribe `.git/index`: se trabaja sobre un índice en memoria, sin
 ///   fichero de respaldo, que parte de una copia del índice real.
 /// - No toca ficheros del árbol de trabajo.
-pub fn create_snapshot(root: &Path, session_id: &str, message: &str) -> NudeResult<Snapshot> {
+///
+/// `diff_base_ref`: ref interna con la que calcular `files` (p. ej. el
+/// checkpoint anterior). Si es `None` o no resuelve, se usa `HEAD`.
+pub fn create_snapshot(
+    root: &Path,
+    session_id: &str,
+    message: &str,
+    diff_base_ref: Option<&str>,
+) -> NudeResult<Snapshot> {
     validate_ref_component(session_id)?;
     let repo = open_worktree(root)?;
 
@@ -51,7 +59,10 @@ pub fn create_snapshot(root: &Path, session_id: &str, message: &str) -> NudeResu
 
     let git_ref = create_checkpoint_ref(&repo, session_id, commit_oid)?;
 
-    let base_tree = head_tree(&repo)?;
+    let base_tree = match diff_base_ref.and_then(|r| resolve_checkpoint_tree(&repo, r).ok()) {
+        Some(tree) => Some(tree),
+        None => head_tree(&repo)?,
+    };
     let diff = repo.diff_tree_to_tree(base_tree.as_ref(), Some(&tree), None)?;
     let files = collect_file_diffs(&diff)?;
 
@@ -62,8 +73,39 @@ pub fn create_snapshot(root: &Path, session_id: &str, message: &str) -> NudeResu
     })
 }
 
+/// Id del árbol que tendría un snapshot ahora mismo, sin crear commit ni ref
+/// (solo escribe objetos en el ODB). Sirve para detectar cambios reales.
+pub fn working_tree_id(root: &Path) -> NudeResult<String> {
+    let repo = open_worktree(root)?;
+    Ok(snapshot_tree(&repo)?.to_string())
+}
+
+/// Id del árbol de `HEAD` (`None` en una rama sin commits).
+pub fn head_tree_id(root: &Path) -> NudeResult<Option<String>> {
+    let repo = open_worktree(root)?;
+    Ok(head_tree(&repo)?.map(|t| t.id().to_string()))
+}
+
+/// Id del árbol al que apunta una ref de checkpoint.
+pub fn checkpoint_tree_id(root: &Path, git_ref: &str) -> NudeResult<String> {
+    let repo = open_worktree(root)?;
+    Ok(resolve_checkpoint_tree(&repo, git_ref)?.id().to_string())
+}
+
+/// Solo se aceptan refs bajo `refs/nude/checkpoints/` para que ningún
+/// comando pueda apuntar a ramas del usuario.
+pub(super) fn resolve_checkpoint_tree<'r>(
+    repo: &'r Repository,
+    git_ref: &str,
+) -> NudeResult<git2::Tree<'r>> {
+    if !git_ref.starts_with(&format!("{CHECKPOINT_REF_PREFIX}/")) || git_ref.contains("..") {
+        return Err(NudeError::InvalidRefComponent(git_ref.to_owned()));
+    }
+    Ok(repo.find_reference(git_ref)?.peel_to_tree()?)
+}
+
 /// Escribe en el ODB el árbol que representa el working tree actual.
-fn snapshot_tree(repo: &Repository) -> NudeResult<Oid> {
+pub(super) fn snapshot_tree(repo: &Repository) -> NudeResult<Oid> {
     // Copiamos las entradas del índice real para reaprovechar su caché de
     // `stat` (solo se re-hashean ficheros modificados).
     let disk_index = repo.index()?;

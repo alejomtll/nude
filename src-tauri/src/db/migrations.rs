@@ -50,6 +50,14 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX idx_file_diffs_checkpoint ON file_diffs(checkpoint_id);
     "#,
+    // v2 — id externo de la sesión del agente (jsonl de Claude/Codex, `ses_*` de
+    // OpenCode) para reutilizar la misma fila entre checkpoints.
+    r#"
+    ALTER TABLE agent_sessions ADD COLUMN external_id TEXT;
+    CREATE UNIQUE INDEX idx_agent_sessions_external
+        ON agent_sessions(project_id, agent_tool, external_id)
+        WHERE external_id IS NOT NULL;
+    "#,
 ];
 
 pub fn run(conn: &mut Connection) -> NudeResult<()> {

@@ -1,20 +1,22 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "nude",
+  "productName": "Nude",
   "version": "0.1.0",
   "identifier": "com.nude.app",
   "build": {
-    "beforeDevCommand": "npm run dev",
-    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run build",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },
   "app": {
     "windows": [
       {
-        "title": "nude",
-        "width": 800,
-        "height": 600
+        "title": "Nude",
+        "width": 1240,
+        "height": 790,
+        "minWidth": 800,
+        "minHeight": 500,
+        "theme": "Dark"
       }
     ],
     "security": {

@@ -119,7 +119,7 @@ fn snapshot_does_not_touch_head_branch_or_index() {
     let head_before = fs::read_to_string(repo.path().join("HEAD")).expect("HEAD");
     let head_oid_before = repo.head().expect("head").target().expect("oid");
 
-    let snap = create_snapshot(dir.path(), "session-123", "checkpoint de prueba").expect("snapshot");
+    let snap = create_snapshot(dir.path(), "session-123", "checkpoint de prueba", None).expect("snapshot");
 
     // Nada del usuario cambia.
     assert_eq!(fs::read(&index_path).expect("index"), index_before, ".git/index modificado");
@@ -155,7 +155,7 @@ fn snapshot_does_not_touch_head_branch_or_index() {
     assert_eq!(find(&snap.files, "untracked.md").expect("u").change_type, ChangeType::Added);
 
     // Dos snapshots seguidos generan refs distintas.
-    let second = create_snapshot(dir.path(), "session-123", "otro").expect("snapshot 2");
+    let second = create_snapshot(dir.path(), "session-123", "otro", None).expect("snapshot 2");
     assert_ne!(second.git_ref, snap.git_ref);
 }
 
@@ -165,7 +165,7 @@ fn snapshot_works_on_unborn_branch() {
     let repo = Repository::init(dir.path()).expect("init");
     write(dir.path(), "a.txt", "a\n");
 
-    let snap = create_snapshot(dir.path(), "s1", "primer snapshot").expect("snapshot");
+    let snap = create_snapshot(dir.path(), "s1", "primer snapshot", None).expect("snapshot");
     let commit = repo
         .find_reference(&snap.git_ref)
         .expect("ref")
@@ -182,7 +182,7 @@ fn snapshot_works_on_unborn_branch() {
 fn snapshot_rejects_unsafe_session_ids() {
     let (dir, _repo) = repo_with_commit();
     for bad in ["", "../x", "a/b", "a b", ".hidden", "x.lock", "a..b", "ñ"] {
-        assert!(create_snapshot(dir.path(), bad, "m").is_err(), "aceptó {bad:?}");
+        assert!(create_snapshot(dir.path(), bad, "m", None).is_err(), "aceptó {bad:?}");
     }
 }
 
@@ -196,4 +196,86 @@ fn porcelain(repo: &Repository) -> Vec<(String, git2::Status)> {
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
+}
+
+#[test]
+fn restore_returns_working_tree_to_exact_checkpoint_state() {
+    let (dir, repo) = repo_with_commit();
+    write(dir.path(), "tracked.txt", "checkpoint\n");
+    write(dir.path(), "keep/untracked.md", "u1\n");
+    fs::remove_file(dir.path().join("gone.txt")).expect("rm");
+    write(dir.path(), "swap", "file\n"); // fichero que luego será directorio
+    let snap = create_snapshot(dir.path(), "s1", "A", None).expect("snapshot");
+
+    // Cambios posteriores que el rollback debe deshacer.
+    write(dir.path(), "tracked.txt", "later\n");
+    fs::write(dir.path().join("gone.txt"), "back again\n").expect("write");
+    fs::remove_file(dir.path().join("keep/untracked.md")).expect("rm");
+    write(dir.path(), "extra/deep/new.txt", "x\n");
+    fs::remove_file(dir.path().join("swap")).expect("rm");
+    write(dir.path(), "swap/inner.txt", "dir now\n");
+    write(dir.path(), "secret.env", "TOKEN=changed\n"); // ignorado: no se toca
+
+    let head_before = repo.head().expect("head").target().expect("oid");
+    let index_before = fs::read(repo.path().join("index")).expect("index");
+
+    restore_working_tree(dir.path(), &snap.git_ref).expect("restore");
+
+    assert_eq!(fs::read_to_string(dir.path().join("tracked.txt")).expect("r"), "checkpoint\n");
+    assert!(!dir.path().join("gone.txt").exists());
+    assert_eq!(fs::read_to_string(dir.path().join("keep/untracked.md")).expect("r"), "u1\n");
+    assert!(!dir.path().join("extra").exists(), "directorios vacíos deben podarse");
+    assert_eq!(fs::read_to_string(dir.path().join("swap")).expect("r"), "file\n");
+    assert_eq!(fs::read_to_string(dir.path().join("secret.env")).expect("r"), "TOKEN=changed\n");
+
+    // El árbol resultante es idéntico al del checkpoint.
+    assert_eq!(
+        working_tree_id(dir.path()).expect("id"),
+        checkpoint_tree_id(dir.path(), &snap.git_ref).expect("id")
+    );
+    assert_eq!(repo.head().expect("head").target().expect("oid"), head_before);
+    assert_eq!(fs::read(repo.path().join("index")).expect("index"), index_before);
+}
+
+#[test]
+fn restore_rejects_refs_outside_nude_namespace() {
+    let (dir, _repo) = repo_with_commit();
+    assert!(restore_working_tree(dir.path(), "refs/heads/main").is_err());
+    assert!(restore_working_tree(dir.path(), "HEAD").is_err());
+}
+
+#[test]
+fn restore_preserves_ignored_files_inside_a_blocking_directory() {
+    let (dir, _repo) = repo_with_commit();
+    write(dir.path(), "swap", "file\n");
+    let snapshot = create_snapshot(dir.path(), "s1", "checkpoint", None).expect("snapshot");
+    fs::remove_file(dir.path().join("swap")).expect("rm");
+    write(dir.path(), "swap/secret.env", "keep me\n");
+
+    assert!(restore_working_tree(dir.path(), &snapshot.git_ref).is_err());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("swap/secret.env")).expect("ignored file"),
+        "keep me\n"
+    );
+}
+
+#[test]
+fn tree_ids_detect_real_changes_only() {
+    let (dir, _repo) = repo_with_commit();
+    let head = head_tree_id(dir.path()).expect("head").expect("some");
+    assert_eq!(working_tree_id(dir.path()).expect("w"), head);
+
+    write(dir.path(), "secret.env", "ignored\n");
+    assert_eq!(working_tree_id(dir.path()).expect("w"), head, "ignorados no cuentan");
+
+    write(dir.path(), "tracked.txt", "v2\n");
+    let changed = working_tree_id(dir.path()).expect("w");
+    assert_ne!(changed, head);
+
+    // Diff contra un checkpoint previo: solo lo ocurrido desde entonces.
+    let first = create_snapshot(dir.path(), "s1", "uno", None).expect("s1");
+    write(dir.path(), "other.txt", "o\n");
+    let second = create_snapshot(dir.path(), "s1", "dos", Some(&first.git_ref)).expect("s2");
+    assert_eq!(second.files.len(), 1, "{:?}", second.files);
+    assert_eq!(second.files[0].file_path, "other.txt");
 }

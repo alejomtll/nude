@@ -39,6 +39,7 @@ pub struct AgentSession {
     pub project_id: String,
     pub agent_tool: String,
     pub model_name: Option<String>,
+    pub external_id: Option<String>,
     pub started_at: String,
     pub ended_at: Option<String>,
 }
@@ -49,6 +50,8 @@ pub struct Checkpoint {
     pub id: String,
     pub session_id: String,
     pub project_id: String,
+    pub agent_tool: String,
+    pub model_name: Option<String>,
     pub git_ref: String,
     pub prompt_summary: Option<String>,
     pub files_changed_count: i64,
