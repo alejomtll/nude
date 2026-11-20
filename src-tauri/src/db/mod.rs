@@ -16,9 +16,7 @@ use rusqlite::Connection;
 
 use crate::error::{NudeError, NudeResult};
 
-/// Nombre del fichero dentro del directorio de datos de la app
-/// (`~/Library/Application Support/com.nude.app/`).
-pub const DB_FILE_NAME: &str = "nude.db";
+const DB_FILE_NAME: &str = "nude.db";
 
 /// Conexión compartida. Es barata de clonar (Arc) para poder moverla a
 /// `spawn_blocking` desde los comandos async.
@@ -28,12 +26,11 @@ pub struct Database {
 }
 
 impl Database {
-    /// Abre (o crea) la base de datos en `path` y aplica las migraciones pendientes.
-    pub fn open(path: &Path) -> NudeResult<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let conn = Connection::open(path)?;
+    /// Abre la base en el directorio de Tauri, independiente del binario instalado.
+    /// En macOS: `~/Library/Application Support/com.nude.app/nude.db`.
+    pub fn open_in_app_dir(data_dir: &Path) -> NudeResult<Self> {
+        std::fs::create_dir_all(data_dir)?;
+        let conn = Connection::open(data_dir.join(DB_FILE_NAME))?;
         Self::init(conn)
     }
 

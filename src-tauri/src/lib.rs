@@ -13,9 +13,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            // ~/Library/Application Support/com.nude.app/nude.db
             let data_dir = app.path().app_data_dir()?;
-            let database = db::Database::open(&data_dir.join(db::DB_FILE_NAME))?;
+            let database = db::Database::open_in_app_dir(&data_dir)?;
 
             // Vigilancia de los proyectos ya registrados + checkpoints automáticos.
             let home = app.path().home_dir()?;

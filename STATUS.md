@@ -1,12 +1,12 @@
 # Estado del proyecto Nude
 
 > Checklist vivo. Cada agente lo actualiza al terminar una tarea (ver AGENTS.md §5).
-> Última actualización: 2026-11-20 — Fase 4 (grafo Git, selector nativo y asistente de seguridad).
+> Última actualización: 2026-11-20 — Persistencia entre actualizaciones e identidad de instalación en macOS.
 
 ## Fase 1 — Backend base (Rust) ✅
 
 ### `src-tauri/src/db/` — SQLite
-- [x] `Database::open()` crea `~/Library/Application Support/com.nude.app/nude.db` (directorio incluido)
+- [x] `Database::open_in_app_dir()` crea el directorio de datos de Tauri y abre `nude.db`
 - [x] PRAGMAs: `foreign_keys = ON`, `journal_mode = WAL`, `busy_timeout = 5s`
 - [x] Migraciones versionadas con `PRAGMA user_version` (`db/migrations.rs`, v1)
 - [x] Tablas `projects`, `agent_sessions`, `checkpoints`, `file_diffs` + índices y `CHECK` de enums
@@ -123,3 +123,12 @@
 ### Notas
 - El grafo muestra los últimos 50 commits; las líneas que siguen más allá llegan al borde inferior.
 - Los cambios hechos con Git desde la terminal no generan eventos (el watcher ignora `.git/`): el grafo se actualiza al volver el foco a la ventana o con el botón de refrescar.
+
+## Persistencia entre actualizaciones en macOS ✅
+
+- [x] **Nude** es el nombre del paquete y de la ventana principal. `com.nude.app` es el identificador estable de las instalaciones existentes.
+- [x] La base se guarda en `~/Library/Application Support/com.nude.app/nude.db` vía `app_data_dir`, independientemente de dónde se instale el binario o qué versión se ejecute.
+- [x] Las tablas e índices se crean con `IF NOT EXISTS`. La lectura de `user_version` y las migraciones pendientes se ejecutan dentro de una transacción SQLite.
+- [x] La revisión del árbol de trabajo y del historial de Git solo encontró la ruta persistente como ubicación de `nude.db`.
+- [x] La prueba de actualización y reapertura conservó proyectos, sesiones, checkpoints y diffs de bases con el esquema inicial, con y sin versión registrada.
+- [x] `cargo check --manifest-path src-tauri/Cargo.toml`, `cargo test --lib` (44 pruebas) y `npm run build` pasaron.
