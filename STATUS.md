@@ -1,7 +1,7 @@
 # Estado del proyecto Nude
 
 > Checklist vivo. Cada agente lo actualiza al terminar una tarea (ver AGENTS.md §5).
-> Última actualización: 2026-11-20 — Pantalla inicial de proyectos.
+> Última actualización: 2026-11-21 — Correcciones de Fase 6: ⌘K y diagnóstico del watcher.
 
 ## Fase 1 — Backend base (Rust) ✅
 
@@ -167,3 +167,83 @@ Solo `src/`; `src-tauri/` sin cambios (IPC, eventos y comandos intactos).
 - [x] Desde el inicio se puede abrir un proyecto registrado, elegir una carpeta en Finder o pegar una ruta con el diálogo existente.
 - [x] Abrir un proyecto muestra el espacio de trabajo de tres paneles. El wordmark del sidebar vuelve al inicio incluso con la barra colapsada.
 - [x] `npm run build` sin errores. Verificados con IPC simulado el inicio, la apertura, el regreso en ambos estados de la barra lateral, el diálogo de ruta y la selección o cancelación en Finder.
+
+## Fase 6 — Paleta de comandos, editores y firewall de archivos ✅
+
+> Pedida como "Fase 5"; se numera 6 porque la Fase 5 ya era el rediseño visual.
+
+### Paleta de comandos (`⌘K`)
+- [x] `src/CommandPalette.tsx`: modal estilo Linear/OpenCode sobre `<dialog>`; `⌘K` abre/cierra en cualquier pantalla (salvo con un diálogo abierto), `Esc` o clic fuera cierran, `↑/↓` (y `⌃N/⌃P`) navegan, `↵` ejecuta. Búsqueda difusa (`fuzzyScore` en `workspace.ts`) con agrupación por sección cuando no hay texto
+- [x] Comandos: Timeline/Grafo Git, checkpoint manual, deshacer último agente (consulta `preview_undo_last_agent` y abre la confirmación), firewall de archivos, abrir el archivo del inspector (en su primera línea cambiada) o el proyecto en cada editor instalado/Finder, cambiar de proyecto, agregar proyecto, barra lateral y volver al inicio
+- [x] Atajo visible `⌘K` en la barra superior
+
+### Editores
+- [x] `commands/editor.rs`: `list_editors()` → `{ id, name, installed }[]` y `open_in_editor({ path, line, editor })` con `editor` = `cursor` | `vscode` | `zed` | `finder`
+  - Localiza la app en `/Applications`, `~/Applications` o por bundle id con Spotlight (`mdfind`); usa la CLI del propio bundle (`code`/`cursor -g ruta:línea`, `zed ruta:línea`), sin depender del `PATH`. Sin CLI: `open -a <app>` (sin línea). Finder: `open -R` (archivo) u `open` (carpeta)
+  - Exige ruta absoluta existente; solo procesos locales, sin red
+- [x] Inspector de diffs: botón discreto junto a la ruta para abrir el archivo en la primera línea cambiada; desplegable para elegir editor (la preferencia se guarda en `localStorage`). Desactivado en archivos borrados
+
+### Firewall de archivos (guardrails)
+- [x] Migración v3: tabla `project_guardrails` (`project_id`, `pattern`, `action` `warn`|`auto_revert`, `UNIQUE(project_id, pattern)`, `ON DELETE CASCADE`)
+- [x] `safety.rs`: `normalize_guardrail_pattern` (quita `./` y `/`, `dir/` → `dir/**`, rechaza `..`, `.git`, vacíos) y `guardrail_matches` (estilo `.gitignore`: `*`/`?` no cruzan carpetas, `**` sí; sin `/` vale en cualquier nivel)
+- [x] Comandos `list_guardrails({ projectId })`, `set_guardrail({ projectId, pattern, action })` (crea o cambia la acción) y `remove_guardrail({ guardrailId })`; avisan al watcher para rehacer la copia de los ignorados
+- [x] `watcher/guardrails.rs`: el watcher revisa las rutas protegidas con un debounce propio de 250 ms (tope 1 s), siempre **antes** de crear el checkpoint, bajo `CAPTURE_LOCK`
+  - Solo actúa si hay una sesión de agente escrita en los últimos 2 min (`detect_session_within`); los cambios del usuario no se bloquean
+  - Referencia = árbol del último checkpoint (o `HEAD`). Archivos ignorados por Git (`.env*`): copia **solo en memoria** (≤ 1 MiB, ≤ 256 archivos), tomada al vigilar el proyecto y al cambiar las reglas, y actualizada con los cambios del usuario. Nunca se guarda en disco, SQLite ni `.git`
+  - `auto_revert`: reescribe el archivo, lo recrea si se borró o lo elimina si el agente lo creó (`git/guard.rs`: `restore_path_from_baseline`, sin tocar `HEAD`, ramas ni `.git/index`); si se borra una carpeta entera se expanden sus archivos protegidos
+  - Evento `guardrail-triggered` (`{ projectId, projectName, agentTool, modelName, detectedAt, violations[] }`) y notificación nativa con `tauri-plugin-notification` (una por ráfaga). No repite el aviso para el mismo contenido
+- [x] Cabecera del proyecto: botón "Firewall" con contador y popover (lista de reglas con conmutador Avisar/Revertir, quitar, añadir patrón, sugerencias `.env*`, `migrations/**`, `Cargo.lock`, `package-lock.json`, `*.pem`)
+- [x] Avisos en vivo arriba a la derecha con agente, archivos y si se restauraron; clic = abrir el proyecto
+
+### Verificación
+- [x] `cargo check --manifest-path src-tauri/Cargo.toml` sin errores ni avisos
+- [x] `cargo test --lib` — 57 pruebas (glob y normalización, CRUD + cascada de guardrails, restauración de un archivo contra `HEAD`/checkpoint, ignorados, auto-revert de tracked/nuevos/carpetas borradas, `.env` desde la copia en memoria, modo aviso sin repetir, cambios del usuario no bloqueados, planes de lanzamiento de editores y **watcher real** con sesión de Claude simulada: el aviso llega antes del debounce, el archivo se restaura y el checkpoint posterior solo contiene lo permitido)
+- [x] `npm run build` sin errores
+- [x] Revisado en navegador con IPC simulado: `⌘K`, filtro, ejecución (`open_in_editor` con ruta y línea), popover del firewall y aviso en vivo
+- [ ] Probar en la app Tauri real: notificación de macOS (permiso del sistema), apertura en Cursor/VS Code/Zed instalados y auto-revert con un agente real
+
+### Notas
+- La atribución "es del agente" se basa en la actividad reciente de su historial (2 min). Si editas a mano un archivo protegido mientras un agente está trabajando, con `auto_revert` también se revierte.
+- Un `git checkout`/`pull` desde la terminal con un agente activo puede revertir archivos protegidos que cambie (Nude no ve las operaciones Git, el watcher ignora `.git/`). Los cambios de rama hechos desde Nude no se ven afectados.
+- Los archivos ignorados protegidos que superan 1 MiB, o los que viven dentro de carpetas ignoradas enteras (`node_modules/`), solo generan aviso.
+- La copia en memoria de los ignorados se pierde al cerrar Nude y se rehace al abrir.
+
+## Fase 6.1 — Correcciones tras la prueba en `Nude.app` ✅
+
+### Diagnóstico (con los datos reales, 2026-11-21)
+- **⌘K no abría nada porque la app instalada no tenía la Fase 6.** El commit `c73bd` de `main` ("fase 6 …") solo añade `logo-macos.png` y un archivo vacío llamado `=`; el código de la fase vive en la rama `claude/nude-phase-5-commands-guardrails-07f074` sin commitear. El binario de `/Applications/Nude.app` no contiene `open_in_editor` ni `project_guardrails`, y `nude.db` sigue en `user_version = 2` (sin la migración v3).
+- **El watcher sí funcionaba**: registró el checkpoint de `logo-macos.png` y `=` (14:54) en `nude`. Los agentes trabajaron hoy en el worktree `.claude/worktrees/nude-phase-5-…`, que está en `.git/info/exclude`: sus cambios no tocan el árbol de `nude`, así que no había nada que capturar ahí. Tampoco hubo sesiones de Codex hoy (`~/.codex/sessions/2026/11/21` no existe).
+- La ventana de atribución **nunca bajó de 15 min**: los 2 min solo se aplicaban al firewall. Ahora es explícito en el código, en los tests y en la UI.
+
+### ⌘K
+- [x] Listener global en **fase de captura** (`{ capture: true }`) con `preventDefault()` + `stopImmediatePropagation()`; ignora ⌘K con un diálogo de acción abierto
+- [x] Menú nativo = menú por defecto de macOS + **Ir › Paleta de comandos… `⌘K`** (`CmdOrCtrl+K`), que emite `open-command-palette`. Si llegan la tecla y el acelerador, el segundo se descarta (400 ms)
+- [x] `lib.rs` no tenía menú propio; el menú por defecto de Tauri no usa ⌘K
+
+### Watcher
+- [x] `watcher/status.rs`: estado por proyecto (`starting` | `active` | `error` | `stopped`, error exacto, vigilando desde, último evento, última revisión, último checkpoint). Evento `watcher-status` cuando cambia el estado o el error
+- [x] Al arrancar se vigilan **todos** los proyectos de SQLite en el hilo del watcher. Antes de vigilar se comprueba que macOS deja leer la carpeta; un `PermissionDenied` da un mensaje que explica cómo conceder el permiso. Si falla `notify`, la carpeta no existe o una revisión falla, el error se guarda y se ve en la UI
+- [x] Los proyectos que fallan se reintentan cada 30 s. Si `notify` no arranca, el hilo sigue vivo para el escaneo forzado
+- [x] `force_scan({ projectId })` → `{ checkpoint, status }`: reintenta la vigilancia, pasa el firewall y revisa el árbol al momento, sin esperar a `notify` ni al debounce
+- [x] `get_watcher_status({ projectId })` y `get_watcher_diagnostics({ projectId })` → estado, última sesión de agente de los últimos 7 días (`cwd`, hora, si aún es atribuible) y worktrees enlazados del repo con su rama, su última sesión y si ya son proyecto
+
+### Sesiones de agentes (`watcher/sessions.rs`)
+- [x] Ventana parametrizada: `detect_active_session` = 15 min (checkpoints) y `detect_session_within(…, AGENT_WINDOW = 2 min)` solo para el firewall
+- [x] `cwd` normalizado (`canonicalize` + sin `/` final) al comparar Codex, OpenCode y Claude; se prueba la raíz tal cual y canónica
+- [x] Claude: si la carpeta codificada de `~/.claude/projects` no coincide (symlink, subcarpeta, `/` final), busca entre las sesiones activas la que declare un `cwd` dentro del proyecto
+- [x] Un `cwd` dentro de un repo o worktree anidado (con su propio `.git`, como `.claude/worktrees/<tarea>`) ya no se atribuye al proyecto padre
+- [x] `DetectedSession.cwd` con la carpeta de trabajo real del agente
+
+### UI
+- [x] El indicador junto al nombre del proyecto es un botón: `en vivo`, `conectando`, `sin conexión` o **`sin vigilancia`** en rojo si hay error
+- [x] Su popover muestra el estado (`Activo` o el error exacto), las horas, la última sesión de agente (`cwd` y hora), las ventanas 15/2 min, los **worktrees sin vigilar** con botón "Vigilar" (los da de alta como proyecto) y **"Forzar escaneo ahora"**
+
+### Verificación
+- [x] `cargo check --manifest-path src-tauri/Cargo.toml` sin errores ni avisos
+- [x] `cargo test --lib` — 61 pruebas (nuevas: ventana 15 min frente a 2 min, `cwd` con symlink, `/` final y subcarpeta, plan B de Claude por `cwd`, worktree anidado, estado de error exacto con carpeta inexistente, escaneo forzado sin esperar al debounce y reintento al volver la carpeta)
+- [x] `npm run build` sin errores
+- [x] Revisado con IPC simulado: popover de diagnóstico, escaneo forzado y ⌘K (tecla, evento nativo, duplicado descartado)
+- [ ] Reconstruir `Nude.app` **desde esta rama** y probar ⌘K, el menú Ir y el diagnóstico en la app real
+
+### Notas
+- Para registrar el trabajo de un agente en un worktree, hay que vigilar ese worktree como proyecto (botón "Vigilar" del diagnóstico). Sus checkpoints usan las mismas refs internas `refs/nude/checkpoints/…`, compartidas por todos los worktrees del repo.

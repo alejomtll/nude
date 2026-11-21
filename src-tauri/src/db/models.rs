@@ -86,6 +86,45 @@ pub struct FileDiff {
     pub patch_text: Option<String>,
 }
 
+/// Qué hace el firewall cuando un agente toca una ruta protegida.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardrailAction {
+    /// Evento + notificación; el cambio se queda.
+    Warn,
+    /// Evento + notificación y el archivo vuelve al último snapshot.
+    AutoRevert,
+}
+
+impl GuardrailAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GuardrailAction::Warn => "warn",
+            GuardrailAction::AutoRevert => "auto_revert",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "warn" => Some(GuardrailAction::Warn),
+            "auto_revert" => Some(GuardrailAction::AutoRevert),
+            _ => None,
+        }
+    }
+}
+
+/// Fila de `project_guardrails`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Guardrail {
+    pub id: i64,
+    pub project_id: String,
+    /// Glob relativo a la raíz (`.env*`, `migrations/**`, `Cargo.lock`).
+    pub pattern: String,
+    pub action: GuardrailAction,
+    pub created_at: String,
+}
+
 pub fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }

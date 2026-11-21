@@ -73,7 +73,7 @@ fn restore_to_tree(repo: &Repository, root: &Path, target: &git2::Tree<'_>) -> N
     Ok(touched)
 }
 
-fn safe_join(root: &Path, rel: Option<&Path>) -> NudeResult<PathBuf> {
+pub(super) fn safe_join(root: &Path, rel: Option<&Path>) -> NudeResult<PathBuf> {
     let rel = rel.ok_or_else(|| NudeError::NotFound("ruta vacía en el diff".into()))?;
     let valid = rel.components().all(|c| match c {
         Component::Normal(name) => name != ".git",
@@ -85,7 +85,7 @@ fn safe_join(root: &Path, rel: Option<&Path>) -> NudeResult<PathBuf> {
     Ok(root.join(rel))
 }
 
-fn remove_path(path: &Path, root: &Path) -> NudeResult<()> {
+pub(super) fn remove_path(path: &Path, root: &Path) -> NudeResult<()> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => fs::remove_dir(path)?,
         Ok(_) => fs::remove_file(path)?,
@@ -103,7 +103,7 @@ fn remove_path(path: &Path, root: &Path) -> NudeResult<()> {
     Ok(())
 }
 
-fn write_entry(
+pub(super) fn write_entry(
     repo: &Repository,
     root: &Path,
     path: &Path,

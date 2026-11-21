@@ -16,6 +16,7 @@ Ubicación: `~/Library/Application Support/com.nude.app/nude.db`
 - `agent_sessions`: `id`, `project_id`, `agent_tool` (`claude-code` | `codex` | `opencode` | `manual`), `model_name`, `external_id` (id de la sesión en el historial del agente; migración v2), `started_at`, `ended_at`
 - `checkpoints`: `id`, `session_id`, `project_id`, `git_ref`, `prompt_summary`, `files_changed_count`, `created_at`
 - `file_diffs`: `id`, `checkpoint_id`, `file_path`, `change_type` (`added` | `modified` | `deleted`), `patch_text`
+- `project_guardrails`: `id`, `project_id`, `pattern` (glob relativo a la raíz, único por proyecto), `action` (`warn` | `auto_revert`), `created_at` (migración v3)
 
 ## 4. Convenciones de Código
 - **Rust:** Usar `thiserror` o `Result<T, String>` limpio en comandos Tauri; cero `.unwrap()` en rutas de producción que puedan cerrar la app. Modularizar en:

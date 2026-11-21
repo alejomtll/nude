@@ -5,8 +5,11 @@
 
 // `generate_handler!` necesita la ruta real del módulo (no un re-export).
 pub mod checkpoints;
+pub mod editor;
 pub mod git;
+pub mod guardrails;
 pub mod projects;
+pub mod watcher;
 
 use crate::db::Database;
 use crate::db::models::Project;

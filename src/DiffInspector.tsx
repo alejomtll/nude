@@ -1,7 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
-import { KeyRound, Repeat2, TriangleExclamationPoint } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
-import { errorMessage, fileCount, type FileAlert, type FileDiff, type Resource } from "./workspace";
+import { ChevronDown, KeyRound, Repeat2, SquareArrowOutUpRight, TriangleExclamationPoint } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  errorMessage, fileCount, joinPath, openInEditor, useEditors,
+  type FileAlert, type FileDiff, type OpenTarget, type Resource,
+} from "./workspace";
+
+export type Editors = ReturnType<typeof useEditors>;
 
 const changes = {
   added: { label: "Agregado", marker: "A" },
@@ -47,6 +52,78 @@ export function parsePatch(patch: string): PatchLine[] {
     }
   }
   return lines;
+}
+
+/** Primera línea cambiada del archivo nuevo (para abrir el editor ahí). */
+export function firstChangedLine(patch: string | null): number | null {
+  if (!patch) return null;
+  const lines = parsePatch(patch);
+  const added = lines.find((line) => line.kind === "added");
+  if (added?.newNo) return added.newNo;
+  // Solo borrados: la línea nueva que queda justo donde estaban.
+  const index = lines.findIndex((line) => line.kind === "deleted");
+  if (index < 0) return null;
+  const next = lines.slice(index).find((line) => line.newNo !== undefined);
+  const previous = lines.slice(0, index).reverse().find((line) => line.newNo !== undefined);
+  return next?.newNo ?? (previous?.newNo !== undefined ? previous.newNo + 1 : 1);
+}
+
+/** Botón discreto "abrir en el editor" con selector del editor preferido. */
+function OpenInEditorButton({ editors, target, onError }: {
+  editors: Editors;
+  target: OpenTarget | null;
+  onError: (message: string) => void;
+}) {
+  const [menu, setMenu] = useState(false);
+  const container = useRef<HTMLSpanElement>(null);
+  const { current } = editors;
+
+  useEffect(() => {
+    if (!menu) return;
+    const close = (event: Event) => {
+      if (event instanceof KeyboardEvent && event.key !== "Escape") return;
+      if (event instanceof MouseEvent && container.current?.contains(event.target as Node)) return;
+      setMenu(false);
+    };
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", close);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", close);
+    };
+  }, [menu]);
+
+  if (!current) return null;
+  const open = (id = current.id) => {
+    if (!target) return;
+    openInEditor(id, target.path, target.line).catch((reason: unknown) => onError(errorMessage(reason)));
+  };
+  const where = target?.line ? ` (línea ${target.line})` : "";
+  return (
+    <span ref={container} className="editor-split" data-menu={menu}>
+      <button className="icon-button" disabled={!target} onClick={() => open()}
+        title={target ? `Abrir en ${current.name}${where}` : "El archivo ya no existe"}
+        aria-label={`Abrir en ${current.name}`}>
+        <SquareArrowOutUpRight size={13} aria-hidden="true" />
+      </button>
+      {editors.editors.length > 1 && (
+        <button className="icon-button editor-more" aria-label="Elegir editor" aria-haspopup="menu" aria-expanded={menu}
+          disabled={!target} onClick={() => setMenu((value) => !value)}>
+          <ChevronDown size={11} aria-hidden="true" />
+        </button>
+      )}
+      {menu && (
+        <div className="menu" role="menu">
+          {editors.editors.map((editor, index) => (
+            <button key={editor.id} role="menuitem" autoFocus={index === 0} data-current={editor.id === current.id}
+              onClick={() => { setMenu(false); editors.setPreferred(editor.id); open(editor.id); }}>
+              {editor.id === "finder" ? "Mostrar en Finder" : `Abrir en ${editor.name}`}
+            </button>
+          ))}
+        </div>
+      )}
+    </span>
+  );
 }
 
 const signs = { added: "+", deleted: "-", context: " ", hunk: "", note: "" };
@@ -113,11 +190,27 @@ function AlertSummary({ alerts }: { alerts: FileAlert[] }) {
   );
 }
 
-function CheckpointDiffs({ checkpointId }: { checkpointId: string }) {
+interface InspectorContext {
+  projectRoot: string;
+  editors: Editors;
+  onTarget: (target: OpenTarget | null) => void;
+}
+
+function CheckpointDiffs({ checkpointId, projectRoot, editors, onTarget }: { checkpointId: string } & InspectorContext) {
   const [resource, setResource] = useState<Resource<FileDiff[]>>({});
   const [alerts, setAlerts] = useState<FileAlert[]>([]);
   const [selected, setSelected] = useState<number>(0);
   const [attempt, setAttempt] = useState(0);
+  const [openError, setOpenError] = useState("");
+  const file = resource.data?.[selected];
+  const target = useMemo<OpenTarget | null>(() => (
+    file && file.changeType !== "deleted"
+      ? { path: joinPath(projectRoot, file.filePath), line: firstChangedLine(file.patchText) }
+      : null
+  ), [file, projectRoot]);
+
+  useEffect(() => { onTarget(target); setOpenError(""); }, [target, onTarget]);
+  useEffect(() => () => onTarget(null), [onTarget]);
 
   useEffect(() => {
     let active = true;
@@ -146,7 +239,6 @@ function CheckpointDiffs({ checkpointId }: { checkpointId: string }) {
 
   const files = resource.data;
   if (!files) return <div className="empty-state" role="status">Cargando cambios…</div>;
-  const file = files[selected];
   if (!file) return <div className="empty-state">Este checkpoint no tiene cambios de archivos.</div>;
 
   const alertsByFile = new Map<string, FileAlert[]>();
@@ -188,7 +280,9 @@ function CheckpointDiffs({ checkpointId }: { checkpointId: string }) {
         </span>
         <span className="patch-path" title={file.filePath} dir="ltr">{file.filePath}</span>
         {fileAlerts.map((alert) => <AlertBadge key={alert.kind} alert={alert} />)}
+        <OpenInEditorButton editors={editors} target={target} onError={setOpenError} />
       </div>
+      {openError && <p className="inline-error" role="alert">{openError}</p>}
       {file.patchText ? (
         <UnifiedPatch key={selected} patch={file.patchText} />
       ) : (
@@ -198,13 +292,13 @@ function CheckpointDiffs({ checkpointId }: { checkpointId: string }) {
   );
 }
 
-export function DiffInspector({ checkpointId }: { checkpointId?: string }) {
+export function DiffInspector({ checkpointId, ...context }: { checkpointId?: string } & InspectorContext) {
   return (
     <aside className="inspector pane" aria-labelledby="inspector-heading">
       <header className="pane-header">
         <h2 id="inspector-heading" className="pane-title">Cambios</h2>
       </header>
-      {checkpointId ? <CheckpointDiffs key={checkpointId} checkpointId={checkpointId} /> : (
+      {checkpointId ? <CheckpointDiffs key={checkpointId} checkpointId={checkpointId} {...context} /> : (
         <div className="empty-state">
           <p>Selecciona un checkpoint para ver sus cambios.</p>
         </div>

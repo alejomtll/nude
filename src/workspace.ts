@@ -267,3 +267,229 @@ export function cleanPrompt(text: string | null | undefined): string {
     .replace(/\s+/g, " ")
     .trim();
 }
+
+// ----------------------------------------------- Editores y firewall de archivos
+
+export type EditorId = "cursor" | "vscode" | "zed" | "finder";
+
+export interface EditorInfo {
+  id: EditorId;
+  name: string;
+  installed: boolean;
+}
+
+export type GuardrailAction = "warn" | "auto_revert";
+
+export interface Guardrail {
+  id: number;
+  projectId: string;
+  pattern: string;
+  action: GuardrailAction;
+  createdAt: string;
+}
+
+export interface GuardrailViolation {
+  filePath: string;
+  pattern: string;
+  action: GuardrailAction;
+  changeType: FileDiff["changeType"];
+  reverted: boolean;
+  note: string | null;
+}
+
+export interface GuardrailAlert {
+  projectId: string;
+  projectName: string;
+  agentTool: AgentTool;
+  modelName: string | null;
+  detectedAt: string;
+  violations: GuardrailViolation[];
+}
+
+/** Archivo que está mirando el inspector (para "abrir en el editor"). */
+export interface OpenTarget {
+  path: string;
+  line: number | null;
+}
+
+const EDITOR_KEY = "nude.editor";
+const fallbackEditors: EditorInfo[] = [{ id: "finder", name: "Finder", installed: true }];
+
+export function joinPath(root: string, relative: string) {
+  return `${root.replace(/\/+$/, "")}/${relative.replace(/^\/+/, "")}`;
+}
+
+/** Editores instalados + el preferido (guardado en `localStorage`). */
+export function useEditors() {
+  const [editors, setEditors] = useState<EditorInfo[]>(fallbackEditors);
+  const [preferred, setPreferredState] = useState<EditorId | null>(() => {
+    try {
+      return (window.localStorage.getItem(EDITOR_KEY) as EditorId | null) ?? null;
+    } catch {
+      return null;
+    }
+  });
+
+  useEffect(() => {
+    let active = true;
+    invoke<EditorInfo[]>("list_editors").then(
+      (data) => { if (active) setEditors(data.filter((editor) => editor.installed)); },
+      () => undefined,
+    );
+    return () => { active = false; };
+  }, []);
+
+  const setPreferred = (id: EditorId) => {
+    setPreferredState(id);
+    try {
+      window.localStorage.setItem(EDITOR_KEY, id);
+    } catch {
+      // Solo es una preferencia.
+    }
+  };
+  const current = editors.find((editor) => editor.id === preferred)
+    ?? editors.find((editor) => editor.id !== "finder")
+    ?? editors[0];
+  return { editors, current, setPreferred };
+}
+
+export function openInEditor(editor: EditorId, path: string, line: number | null = null) {
+  return invoke<void>("open_in_editor", { path, line, editor });
+}
+
+export function useGuardrails(projectId: string) {
+  const [resource, setResource] = useState<Resource<Guardrail[]>>({});
+  const [tick, setTick] = useState(0);
+
+  useEffect(() => {
+    let active = true;
+    invoke<Guardrail[]>("list_guardrails", { projectId }).then(
+      (data) => { if (active) setResource({ data }); },
+      (error: unknown) => { if (active) setResource({ error: errorMessage(error) }); },
+    );
+    return () => { active = false; };
+  }, [projectId, tick]);
+
+  const reload = () => setTick((t) => t + 1);
+  return {
+    resource,
+    async set(pattern: string, action: GuardrailAction) {
+      await invoke<Guardrail>("set_guardrail", { projectId, pattern, action });
+      reload();
+    },
+    async remove(guardrailId: number) {
+      await invoke("remove_guardrail", { guardrailId });
+      reload();
+    },
+  };
+}
+
+/** Alertas del firewall en vivo (todas las de la sesión de la app). */
+export function useGuardrailAlerts() {
+  const [alerts, setAlerts] = useState<(GuardrailAlert & { key: number })[]>([]);
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    let next = 0;
+    void listen<GuardrailAlert>("guardrail-triggered", ({ payload }) => {
+      if (active) setAlerts((current) => [{ ...payload, key: next++ }, ...current].slice(0, 4));
+    }).then((stop) => {
+      if (active) unlisten = stop;
+      else stop();
+    }, () => undefined);
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, []);
+  return { alerts, dismiss: (key: number) => setAlerts((current) => current.filter((a) => a.key !== key)) };
+}
+
+/**
+ * Puntuación de búsqueda difusa para la paleta: las letras de `query` deben
+ * aparecer en orden. Premia coincidencias seguidas y al inicio de palabra.
+ * `null` si no coincide.
+ */
+export function fuzzyScore(query: string, text: string): number | null {
+  const q = query.trim().toLowerCase();
+  if (!q) return 0;
+  const t = text.toLowerCase();
+  let score = 0;
+  let from = 0;
+  let previous = -2;
+  for (const char of q) {
+    if (char === " ") continue;
+    const index = t.indexOf(char, from);
+    if (index < 0) return null;
+    score += index === previous + 1 ? 3 : 1;
+    if (index === 0 || /[\s/·:-]/.test(t[index - 1])) score += 2;
+    previous = index;
+    from = index + 1;
+  }
+  return score - t.length * 0.01;
+}
+
+// ------------------------------------------------- Diagnóstico del watcher
+
+export type WatchState = "starting" | "active" | "error" | "stopped";
+
+export interface WatchStatus {
+  projectId: string;
+  state: WatchState;
+  error: string | null;
+  watchingSince: string | null;
+  lastEventAt: string | null;
+  lastScanAt: string | null;
+  lastCheckpointAt: string | null;
+}
+
+export interface AgentSighting {
+  agentTool: AgentTool;
+  modelName: string | null;
+  cwd: string | null;
+  lastActivity: string;
+  attributable: boolean;
+}
+
+export interface WorktreeDiagnostic {
+  path: string;
+  branch: string | null;
+  projectId: string | null;
+  lastSession: AgentSighting | null;
+}
+
+export interface WatcherDiagnostics {
+  status: WatchStatus;
+  rootPath: string;
+  lastSession: AgentSighting | null;
+  worktrees: WorktreeDiagnostic[];
+  attributionWindowMinutes: number;
+  firewallWindowMinutes: number;
+}
+
+/** Estado de vigilancia del proyecto, en vivo (evento `watcher-status`). */
+export function useWatchStatus(projectId: string) {
+  const [status, setStatus] = useState<WatchStatus | null>(null);
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    const load = () => invoke<WatchStatus>("get_watcher_status", { projectId }).then(
+      (data) => { if (active) setStatus(data); },
+      () => undefined,
+    );
+    void listen<WatchStatus>("watcher-status", ({ payload }) => {
+      if (active && payload.projectId === projectId) setStatus(payload);
+    }).then((stop) => {
+      if (active) unlisten = stop;
+      else stop();
+    }, () => undefined);
+    void load();
+    window.addEventListener("focus", load);
+    return () => {
+      active = false;
+      unlisten?.();
+      window.removeEventListener("focus", load);
+    };
+  }, [projectId]);
+  return { status, setStatus };
+}
