@@ -244,3 +244,26 @@ export function suggestedBranchName(now = new Date()) {
   const pad = (n: number) => String(n).padStart(2, "0");
   return `prueba/agente-${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`;
 }
+
+/**
+ * Convierte un prompt con Markdown crudo en una línea legible: quita bloques
+ * y marcas de código, encabezados, énfasis, citas, viñetas, enlaces y saltos
+ * de línea (reales o escapados como `\n`).
+ */
+export function cleanPrompt(text: string | null | undefined): string {
+  if (!text) return "";
+  return text
+    .replace(/\\[nrt]/g, "\n")
+    .replace(/```[\w-]*\s*/g, " ")
+    .replace(/`+/g, "")
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/^\s{0,3}#{1,6}\s+/gm, "")
+    .replace(/^\s*>\s?/gm, "")
+    .replace(/^\s*(?:[-*+•]|\d+[.)])\s+/gm, "")
+    .replace(/(\*\*|__|~~)(.+?)\1/g, "$2")
+    .replace(/(^|[\s(])[*_]([^*_\s][^*_]*?)[*_](?=[\s).,:;!?]|$)/g, "$1$2")
+    .replace(/[*#]{2,}/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}

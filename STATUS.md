@@ -1,7 +1,7 @@
 # Estado del proyecto Nude
 
 > Checklist vivo. Cada agente lo actualiza al terminar una tarea (ver AGENTS.md §5).
-> Última actualización: 2026-11-20 — Persistencia entre actualizaciones e identidad de instalación en macOS.
+> Última actualización: 2026-11-20 — Rediseño visual neutro (Fase 5).
 
 ## Fase 1 — Backend base (Rust) ✅
 
@@ -132,3 +132,31 @@
 - [x] La revisión del árbol de trabajo y del historial de Git solo encontró la ruta persistente como ubicación de `nude.db`.
 - [x] La prueba de actualización y reapertura conservó proyectos, sesiones, checkpoints y diffs de bases con el esquema inicial, con y sin versión registrada.
 - [x] `cargo check --manifest-path src-tauri/Cargo.toml`, `cargo test --lib` (44 pruebas) y `npm run build` pasaron.
+
+## Fase 5 — Rediseño visual neutro ✅
+
+Solo `src/`; `src-tauri/` sin cambios (IPC, eventos y comandos intactos).
+
+### Paleta y tipografía
+- [x] Carbón neutro sin tintes: base `#121212`, sidebar/inspector `#161616`, superficies `#1C1C1C`, hover `#242424`, activo `#222222`, bordes `1px #262626`, separadores `#222222`
+- [x] Texto `#EDEDED` / `#8A8A8A` / `#5C5C5C`, prompts `#A3A3A3`; monoespaciada `JetBrains Mono` → `SF Mono` → `Menlo` (se usa la instalada, sin descargar fuentes) en hashes, rutas, modelos, ramas y diffs
+- [x] Sin gradientes, sombras ni acentos morados. Color solo en adiciones/eliminaciones del diff (y las letras `A`/`D`) y en el punto de 6 px de cada agente (Claude Code, Codex, OpenCode; manual en gris)
+- [x] Grafo Git en escala de grises; avisos de seguridad neutros (icono + negrita), botón destructivo con texto rojo de "eliminación"
+
+### Wordmark
+- [x] `src/Wordmark.tsx`: "Nude" en tipografía modular de bloques (matriz 6×7 por letra, trazos de 2 módulos, contraformas cuadradas, `crispEdges`). Diseño propio en ese estilo, no una copia del logo de OpenCode
+- [x] Bienvenida (sin proyectos): wordmark centrado en `#282828` + un único botón "Abrir carpeta" (Finder)
+- [x] Marca de agua en el timeline vacío y versión pequeña en la cabecera del sidebar
+
+### Paneles
+- [x] Sidebar de 220 px colapsable a un riel de 44 px (botón o `⌘B`, preferencia guardada en `localStorage`); lista plana, activo con fondo `#222222`, rutas abreviadas con `~`
+- [x] "Quitar proyecto" pasa a un menú `···` que aparece al pasar el cursor (o con foco) sobre cada proyecto; se eliminan los botones del pie
+- [x] "Checkpoint" manual como botón compacto en la cabecera del timeline
+- [x] Timeline en filas separadas por líneas de `1px`: punto de agente, agente, modelo y nº de archivos en mono, tiempo relativo; prompt en una línea limpia. "Rollback" aparece al pasar el cursor o en la fila seleccionada
+- [x] `cleanPrompt` (`workspace.ts`) quita bloques y marcas de código, encabezados, énfasis, citas, viñetas, enlaces y saltos de línea reales o escapados (`\n`)
+- [x] Inspector: cabecera "Cambios", lista con `M`/`A`/`D`, ruta del archivo en mono y visor de diff estilo GitHub con números de línea antiguos/nuevos; se ocultan las cabeceras `diff --git`/`index`/`---`/`+++`
+
+### Verificación
+- [x] `npm run build` sin errores
+- [x] Revisado en navegador con el IPC simulado: timeline con prompts Markdown, alertas, diff, grafo, menú `···`, sidebar colapsado y pantalla de bienvenida
+- [ ] Revisar en la app Tauri real (fuentes del sistema, selector de Finder)

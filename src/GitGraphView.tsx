@@ -1,9 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import {
-  ArrowRightLeft, Check, Diamond, GitBranch, GitBranchPlus, GitCommitHorizontal, GitGraph as GitGraphIcon,
+  ArrowRightLeft, Check, GitBranch, GitBranchPlus, GitCommitHorizontal,
   RefreshCw, TriangleExclamationPoint,
 } from "lucide-react";
-import { type CSSProperties, type FormEvent, useMemo, useState } from "react";
+import { type FormEvent, useMemo, useState } from "react";
 import {
   agentLabels, errorMessage, fileCount, useGitGraph,
   type CheckpointAnchor, type CommitInfo, type CommitResult, type GitGraph, type Project, type StatusKind,
@@ -15,7 +15,8 @@ const ROW = 38;
 const LANE = 16;
 const PAD = 14;
 const WORKTREE_ID = "__worktree__";
-const PALETTE = ["#b9a9f4", "#80dbb6", "#f4b38b", "#a4c9ff", "#f2d479", "#f59fc0", "#7fd4e6", "#c9e58a"];
+// Escala de grises: el color queda reservado a los diffs y a los puntos de agente.
+const PALETTE = ["#EDEDED", "#8A8A8A", "#B5B5B5", "#5C5C5C", "#D0D0D0", "#727272", "#A0A0A0", "#4A4A4A"];
 
 interface Segment { from: number; to: number; color: string }
 interface GraphRow {
@@ -116,19 +117,16 @@ export function GitGraphView({ project, revision, onAction, onOpenCheckpoint, on
   return (
     <>
       <main className="pane graph-pane" aria-labelledby="graph-heading">
-        <header className="pane-header justify-between gap-2">
-          <div className="flex min-w-0 items-center gap-2.5">
-            <GitGraphIcon size={17} className="shrink-0 text-muted" aria-hidden="true" />
-            <h1 id="graph-heading" className="truncate">Grafo Git <span className="text-muted">/ {project.name}</span></h1>
-          </div>
-          <div className="flex items-center gap-1.5">
-            <button className="button" disabled={!graph || graph.head.unborn}
+        <header className="pane-header">
+          <h1 id="graph-heading" className="pane-title" title={project.rootPath}>{project.name}</h1>
+          <div className="pane-actions">
+            <button className="button button-compact" disabled={!graph || graph.head.unborn}
               onClick={() => onAction({ kind: "create-branch", fromCommit: null, label: "HEAD" })}
               title="Crea una rama desde HEAD para probar un agente sin tocar tu rama">
-              <GitBranchPlus size={14} aria-hidden="true" />Rama de prueba
+              <GitBranchPlus size={13} aria-hidden="true" />Rama de prueba
             </button>
             <button className="icon-button" aria-label="Actualizar grafo" title="Actualizar" onClick={reload}>
-              <RefreshCw size={14} aria-hidden="true" />
+              <RefreshCw size={13} aria-hidden="true" />
             </button>
           </div>
         </header>
@@ -227,7 +225,6 @@ function CommitGraph({ graph, onAction, onOpenCheckpoint }: {
                   const current = name === head.branch && isHead;
                   return (
                     <button key={name} className="ref-chip" data-current={current}
-                      style={{ "--chip": row.color } as CSSProperties}
                       title={current ? `Rama actual: ${name}` : `Cambiar a ${name}`}
                       disabled={current} onClick={() => onAction({ kind: "checkout", branch: name })}>
                       {current ? <Check size={11} aria-hidden="true" /> : <GitBranch size={11} aria-hidden="true" />}
@@ -240,7 +237,7 @@ function CommitGraph({ graph, onAction, onOpenCheckpoint }: {
                     onClick={() => onOpenCheckpoint(anchors[0].checkpointId)}
                     title={anchors.slice(0, 6).map((a) =>
                       `${agentLabels[a.agentTool]} · ${a.promptSummary ?? "Sin resumen"}`).join("\n")}>
-                    <Diamond size={10} aria-hidden="true" />
+                    <span className="agent-dot" aria-hidden="true" />
                     {anchors.length === 1 ? agentLabels[anchors[0].agentTool] : `${anchors.length} checkpoints`}
                   </button>
                 )}
@@ -338,10 +335,10 @@ function GitPanel({ project, graph, onAction, onNotice, onCommitted }: {
 
   return (
     <aside className="inspector pane git-panel" aria-labelledby="git-panel-heading">
-      <header className="pane-header gap-2.5">
-        <GitBranch size={16} aria-hidden="true" className="text-muted" />
-        <h2 id="git-panel-heading" className="truncate">
-          {graph ? graph.head.branch ?? (graph.head.detached ? "HEAD separado" : "—") : "Rama"}
+      <header className="pane-header">
+        <h2 id="git-panel-heading" className="pane-title mono">
+          <GitBranch size={13} aria-hidden="true" className="shrink-0 text-faint" />
+          <span className="truncate">{graph ? graph.head.branch ?? (graph.head.detached ? "HEAD separado" : "—") : "Rama"}</span>
         </h2>
       </header>
       {!graph ? <div className="empty-state" role="status">Cargando…</div> : (
@@ -354,14 +351,14 @@ function GitPanel({ project, graph, onAction, onNotice, onCommitted }: {
           )}
 
           <section aria-labelledby="branches-heading">
-            <div className="section-label px-1 pb-1" id="branches-heading">Ramas locales</div>
+            <div className="list-caption" id="branches-heading">Ramas locales</div>
             {graph.branches.length ? (
               <ul className="branch-list">
                 {graph.branches.map((branch) => (
                   <li key={branch.name} className="branch-row" data-current={branch.isHead}>
                     <GitBranch size={13} aria-hidden="true" className="shrink-0" />
                     <span className="min-w-0 flex-1 truncate" title={branch.name}>{branch.name}</span>
-                    {branch.isHead ? <span className="text-muted text-[11px]">actual</span> : (
+                    {branch.isHead ? <span className="text-faint">actual</span> : (
                       <button className="button button-quiet" onClick={() => onAction({ kind: "checkout", branch: branch.name })}>
                         <ArrowRightLeft size={12} aria-hidden="true" />Cambiar
                       </button>
@@ -374,7 +371,7 @@ function GitPanel({ project, graph, onAction, onNotice, onCommitted }: {
 
           <form className="commit-box" onSubmit={(event) => void commit(event)} aria-labelledby="changes-heading">
             <div className="flex items-center justify-between px-1 pb-1">
-              <span className="section-label" id="changes-heading">Cambios · {fileCount(files.length)}</span>
+              <span className="list-caption p-0" id="changes-heading">Cambios · {fileCount(files.length)}</span>
               {files.length > 0 && (
                 <button type="button" className="button button-quiet"
                   onClick={() => setExcluded(allSelected ? new Set(files.map((f) => f.path)) : new Set())}>
@@ -411,7 +408,7 @@ function GitPanel({ project, graph, onAction, onNotice, onCommitted }: {
               <GitCommitHorizontal size={14} aria-hidden="true" />
               {pending ? "Haciendo commit…" : `Commit · ${fileCount(selected.length)}`}
             </button>
-            <p className="mt-2 px-1 text-[11px] leading-relaxed text-muted">
+            <p className="mt-2 px-1 leading-relaxed text-faint">
               Solo entran los archivos marcados. Lo que ya tenías preparado y no marques sigue preparado.
             </p>
           </form>

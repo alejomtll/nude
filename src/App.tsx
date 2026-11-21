@@ -1,13 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
-  CircleDot, ClipboardPaste, Files, FolderGit2, FolderOpen, GitGraph, History, Plus, RotateCcw, Trash2, Undo2,
+  BookmarkPlus, ClipboardPaste, Ellipsis, FolderOpen, PanelLeftClose, PanelLeftOpen, Plus, RotateCcw, Trash2, Undo2,
 } from "lucide-react";
 import { type FormEvent, useEffect, useRef, useState } from "react";
 import { DiffInspector } from "./DiffInspector";
 import { type GraphAction, GitGraphView } from "./GitGraphView";
+import { Wordmark } from "./Wordmark";
 import {
-  agentLabels, errorMessage, fileCount, suggestedBranchName, useCheckpoints, useUndoPlan,
+  agentLabels, cleanPrompt, errorMessage, fileCount, suggestedBranchName, useCheckpoints, useUndoPlan,
   type Checkpoint, type Project, type Resource, type UndoAgentPlan,
 } from "./workspace";
 import "./App.css";
@@ -18,7 +19,7 @@ const shortTime = new Intl.DateTimeFormat("es", { dateStyle: "short", timeStyle:
 
 function timeAgo(date: string, now: number) {
   const minutes = Math.max(0, Math.floor((now - Date.parse(date)) / 60_000));
-  if (minutes < 1) return "Ahora";
+  if (minutes < 1) return "ahora";
   if (minutes < 60) return relativeDate.format(-minutes, "minute");
   if (minutes < 1440) return relativeDate.format(-Math.floor(minutes / 60), "hour");
   return relativeDate.format(-Math.floor(minutes / 1440), "day");
@@ -37,7 +38,7 @@ type Action =
 
 const actions: Record<Action["kind"], { title: string; submit: string }> = {
   add: { title: "Agregar proyecto", submit: "Agregar proyecto" },
-  manual: { title: "Checkpoint Manual", submit: "Guardar checkpoint" },
+  manual: { title: "Checkpoint manual", submit: "Guardar checkpoint" },
   remove: { title: "¿Quitar proyecto?", submit: "Quitar proyecto" },
   rollback: { title: "¿Aplicar rollback?", submit: "Aplicar rollback" },
   undo: { title: "¿Deshacer el último agente?", submit: "Deshacer sesión" },
@@ -190,12 +191,13 @@ function ActionDialog({ action, close, submit }: {
   );
 }
 
-function TimelineView({ project, revision, focus, onRefresh, onRollback }: {
+function TimelineView({ project, revision, focus, onRefresh, onRollback, onManual }: {
   project: Project;
   revision: number;
   focus?: string;
   onRefresh: () => void;
   onRollback: (checkpoint: Checkpoint) => void;
+  onManual: () => void;
 }) {
   const { resource, live } = useCheckpoints(project.id, revision);
   const [selection, setSelection] = useState<string | undefined>(focus);
@@ -215,13 +217,17 @@ function TimelineView({ project, revision, focus, onRefresh, onRollback }: {
   return (
     <>
       <main className="timeline pane" aria-labelledby="timeline-heading">
-        <header className="pane-header min-w-0 justify-between gap-2">
-          <div className="flex min-w-0 items-center gap-2.5">
-            <History size={17} className="shrink-0 text-muted" aria-hidden="true" />
-            <h1 id="timeline-heading" className="truncate" title={project.name}>Timeline <span className="text-muted">/ {project.name}</span></h1>
+        <header className="pane-header">
+          <h1 id="timeline-heading" className="pane-title" title={project.rootPath}>
+            {project.name}
+            {live === "on" && <span className="live-label" role="status" title="Recibiendo checkpoints en vivo"><span />en vivo</span>}
+          </h1>
+          <div className="pane-actions">
+            {live === "off" && <button className="button button-quiet" onClick={onRefresh}>Reconectar</button>}
+            <button className="button button-compact" onClick={onManual} title="Guardar el estado actual como checkpoint">
+              <BookmarkPlus size={13} aria-hidden="true" />Checkpoint
+            </button>
           </div>
-          {live === "on" && <span className="live-label" role="status"><span />En vivo</span>}
-          {live === "off" && <button className="button button-quiet" onClick={onRefresh}>Reconectar</button>}
         </header>
 
         <div className="timeline-scroll">
@@ -234,37 +240,41 @@ function TimelineView({ project, revision, focus, onRefresh, onRollback }: {
           {resource.data ? (
             checkpoints.length ? (
               <ol className="checkpoint-list" aria-label="Checkpoints, del más reciente al más antiguo">
-                {checkpoints.map((checkpoint) => (
-                  <li key={checkpoint.id} id={`checkpoint-${checkpoint.id}`} className="checkpoint-entry" data-agent={checkpoint.agentTool}>
-                    <div className="checkpoint-card" data-selected={checkpoint.id === selected?.id}>
-                      <button className="checkpoint-select" aria-pressed={checkpoint.id === selected?.id}
+                {checkpoints.map((checkpoint) => {
+                  const prompt = cleanPrompt(checkpoint.promptSummary);
+                  const isSelected = checkpoint.id === selected?.id;
+                  const date = fullDate.format(Date.parse(checkpoint.createdAt));
+                  return (
+                    <li key={checkpoint.id} id={`checkpoint-${checkpoint.id}`} className="checkpoint-row"
+                      data-agent={checkpoint.agentTool} data-selected={isSelected}>
+                      <button className="checkpoint-select" aria-pressed={isSelected}
                         onClick={() => setSelection(checkpoint.id)}>
-                        <span className="checkpoint-top">
-                          <span className="agent-badge">{agentLabels[checkpoint.agentTool]}</span>
-                          <span className="model-name" title={checkpoint.modelName ?? undefined}>
-                            {checkpoint.modelName ?? (checkpoint.agentTool === "manual" ? "" : "Modelo desconocido")}
-                          </span>
-                          <time dateTime={checkpoint.createdAt} title={fullDate.format(Date.parse(checkpoint.createdAt))}>
-                            {timeAgo(checkpoint.createdAt, now)}
-                          </time>
+                        <span className="checkpoint-meta">
+                          <span className="agent-dot" aria-hidden="true" />
+                          <span className="agent-name">{agentLabels[checkpoint.agentTool]}</span>
+                          {checkpoint.modelName && (
+                            <span className="model-name" title={checkpoint.modelName}>{checkpoint.modelName}</span>
+                          )}
+                          <span className="checkpoint-files">{fileCount(checkpoint.filesChangedCount)}</span>
+                          <time dateTime={checkpoint.createdAt} title={date}>{timeAgo(checkpoint.createdAt, now)}</time>
                         </span>
-                        <span className="checkpoint-summary" dir="auto">{checkpoint.promptSummary || "Sin resumen"}</span>
+                        <span className="checkpoint-summary" dir="auto" title={prompt || undefined}>
+                          {prompt || <span className="text-faint">Sin resumen</span>}
+                        </span>
                       </button>
-                      <div className="checkpoint-footer">
-                        <span className="flex items-center gap-1.5"><Files size={13} aria-hidden="true" />{fileCount(checkpoint.filesChangedCount)}</span>
-                        <button className="button button-quiet" onClick={() => onRollback(checkpoint)}
-                          aria-label={`Rollback al checkpoint del ${fullDate.format(Date.parse(checkpoint.createdAt))}`}>
-                          <RotateCcw size={13} aria-hidden="true" />Rollback
-                        </button>
-                      </div>
-                    </div>
-                  </li>
-                ))}
+                      <button className="row-action-button" onClick={() => onRollback(checkpoint)}
+                        title="Restaurar los archivos a este checkpoint"
+                        aria-label={`Rollback al checkpoint del ${date}`}>
+                        <RotateCcw size={12} aria-hidden="true" />Rollback
+                      </button>
+                    </li>
+                  );
+                })}
               </ol>
             ) : (
-              <div className="empty-state">
-                <History size={28} aria-hidden="true" />
-                <div><h2>Sin checkpoints</h2><p>Los cambios del repositorio aparecerán aquí.</p></div>
+              <div className="empty-state watermark">
+                <Wordmark height={44} title={null} className="wordmark-faint" />
+                <p>Sin checkpoints todavía. Los cambios del repositorio aparecerán aquí.</p>
               </div>
             )
           ) : !resource.error && <div className="empty-state" role="status">Cargando checkpoints…</div>}
@@ -275,8 +285,8 @@ function TimelineView({ project, revision, focus, onRefresh, onRollback }: {
   );
 }
 
-function TopBar({ project, view, setView, revision, onUndo }: {
-  project?: Project;
+function TopBar({ view, setView, project, revision, onUndo }: {
+  project: Project;
   view: View;
   setView: (view: View) => void;
   revision: number;
@@ -285,14 +295,14 @@ function TopBar({ project, view, setView, revision, onUndo }: {
   return (
     <header className="topbar">
       <div className="view-switch" role="tablist" aria-label="Vista">
-        <button role="tab" aria-selected={view === "timeline"} disabled={!project} onClick={() => setView("timeline")}>
-          <History size={14} aria-hidden="true" />Timeline de Agentes
+        <button role="tab" aria-selected={view === "timeline"} onClick={() => setView("timeline")}>
+          Timeline de agentes
         </button>
-        <button role="tab" aria-selected={view === "graph"} disabled={!project} onClick={() => setView("graph")}>
-          <GitGraph size={14} aria-hidden="true" />Grafo Git
+        <button role="tab" aria-selected={view === "graph"} onClick={() => setView("graph")}>
+          Grafo Git
         </button>
       </div>
-      {project && <UndoButton key={project.id} project={project} revision={revision} onUndo={onUndo} />}
+      <UndoButton key={project.id} project={project} revision={revision} onUndo={onUndo} />
     </header>
   );
 }
@@ -310,12 +320,71 @@ function UndoButton({ project, revision, onUndo }: {
       : `Vuelve al estado anterior a la última sesión de ${agentLabels[plan.agentTool]}`
     : resource.error ?? "Todavía no hay sesiones de agentes en este proyecto";
   return (
-    <button className="button undo-button" disabled={!plan || plan.alreadyUndone} title={title}
+    <button className="button button-compact" disabled={!plan || plan.alreadyUndone} title={title}
       onClick={() => plan && onUndo(plan)}>
-      <Undo2 size={14} aria-hidden="true" />Deshacer último agente
-      {plan && !plan.alreadyUndone && <span className="undo-agent" data-agent={plan.agentTool}>{agentLabels[plan.agentTool]}</span>}
+      <Undo2 size={13} aria-hidden="true" />Deshacer último agente
+      {plan && !plan.alreadyUndone && (
+        <span className="undo-agent" data-agent={plan.agentTool}>
+          <span className="agent-dot" aria-hidden="true" />{agentLabels[plan.agentTool]}
+        </span>
+      )}
     </button>
   );
+}
+
+function ProjectRow({ project, active, onSelect, onRemove }: {
+  project: Project;
+  active: boolean;
+  onSelect: () => void;
+  onRemove: () => void;
+}) {
+  const [menu, setMenu] = useState(false);
+  const container = useRef<HTMLLIElement>(null);
+
+  useEffect(() => {
+    if (!menu) return;
+    const close = (event: Event) => {
+      if (event instanceof KeyboardEvent && event.key !== "Escape") return;
+      if (event instanceof MouseEvent && container.current?.contains(event.target as Node)) return;
+      setMenu(false);
+    };
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", close);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", close);
+    };
+  }, [menu]);
+
+  return (
+    <li ref={container} className="project-item" data-active={active} data-menu={menu}>
+      <button className="project-row" aria-pressed={active} title={project.rootPath} onClick={onSelect}>
+        <span className="project-name" dir="auto">{project.name}</span>
+        <span className="project-path" dir="ltr">{project.rootPath.replace(/^\/Users\/[^/]+/, "~")}</span>
+      </button>
+      <button className="project-more" aria-label={`Opciones de ${project.name}`} aria-haspopup="menu"
+        aria-expanded={menu} onClick={() => setMenu((open) => !open)}>
+        <Ellipsis size={14} aria-hidden="true" />
+      </button>
+      {menu && (
+        <div className="menu" role="menu">
+          <button role="menuitem" autoFocus onClick={() => { setMenu(false); onRemove(); }}>
+            <Trash2 size={13} aria-hidden="true" />Quitar proyecto
+          </button>
+        </div>
+      )}
+    </li>
+  );
+}
+
+const SIDEBAR_KEY = "nude.sidebarCollapsed";
+
+function readCollapsed() {
+  try {
+    return window.localStorage.getItem(SIDEBAR_KEY) === "1";
+  } catch {
+    return false;
+  }
 }
 
 function App() {
@@ -327,10 +396,30 @@ function App() {
   const [notice, setNotice] = useState("");
   const [view, setView] = useState<View>("timeline");
   const [focus, setFocus] = useState<string>();
+  const [collapsed, setCollapsed] = useState(readCollapsed);
   const items = projects.data ?? [];
   const project = items.find((item) => item.id === projectId) ?? items[0];
   const refresh = () => setRevision((current) => current + 1);
   const announce = (text: string) => { setNotice(text); refresh(); };
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(SIDEBAR_KEY, collapsed ? "1" : "0");
+    } catch {
+      // Preferencia solo visual: si no se puede guardar, no pasa nada.
+    }
+  }, [collapsed]);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "b") {
+        event.preventDefault();
+        setCollapsed((value) => !value);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -351,7 +440,7 @@ function App() {
     setNotice(created ? "Proyecto agregado" : "Proyecto seleccionado");
   }
 
-  /** Botón "Agregar proyecto": abre Finder directamente; si falla, el diálogo con ruta. */
+  /** "Abrir carpeta": abre Finder directamente; si falla, el diálogo con ruta. */
   async function addFromFinder() {
     setNotice("");
     try {
@@ -409,94 +498,77 @@ function App() {
   }
 
   return (
-    <div className="workspace">
-      <aside className="sidebar pane" aria-labelledby="projects-heading">
-        <header className="pane-header justify-between gap-2">
-          <h2 id="projects-heading">Proyectos</h2>
-          <span className="flex gap-1">
-            <button className="icon-button" aria-label="Pegar ruta de un proyecto" title="Pegar ruta"
-              disabled={!projects.data} onClick={() => setAction({ kind: "add" })}>
-              <ClipboardPaste size={15} aria-hidden="true" />
-            </button>
-            <button className="icon-button" aria-label="Agregar proyecto desde Finder" title="Agregar proyecto (Finder)"
-              disabled={!projects.data} onClick={() => void addFromFinder()}>
-              <Plus size={17} aria-hidden="true" />
-            </button>
-          </span>
+    <div className="workspace" data-sidebar={collapsed ? "collapsed" : "open"}>
+      <aside className="sidebar pane" aria-label="Proyectos">
+        <header className="sidebar-header">
+          {!collapsed && <Wordmark height={11} className="sidebar-wordmark" />}
+          <button className="icon-button" onClick={() => setCollapsed((value) => !value)}
+            aria-label={collapsed ? "Mostrar barra lateral" : "Ocultar barra lateral"}
+            title={`${collapsed ? "Mostrar" : "Ocultar"} barra lateral (⌘B)`} aria-expanded={!collapsed}>
+            {collapsed ? <PanelLeftOpen size={15} aria-hidden="true" /> : <PanelLeftClose size={15} aria-hidden="true" />}
+          </button>
         </header>
-        <div className="project-list">
-          {projects.error ? (
-            <div className="px-2 pt-2 text-sm" role="alert">
-              <p className="error-text">{projects.error}</p>
-              <button className="button mt-2" onClick={() => { setProjects({}); setAttempt(attempt + 1); }}>Reintentar</button>
+        {!collapsed && (
+          <>
+            <div className="sidebar-section">
+              <h2 id="projects-heading">Proyectos</h2>
+              <span className="flex">
+                <button className="icon-button" aria-label="Pegar ruta de un proyecto" title="Pegar ruta"
+                  disabled={!projects.data} onClick={() => setAction({ kind: "add" })}>
+                  <ClipboardPaste size={13} aria-hidden="true" />
+                </button>
+                <button className="icon-button" aria-label="Abrir carpeta en Finder" title="Abrir carpeta (Finder)"
+                  disabled={!projects.data} onClick={() => void addFromFinder()}>
+                  <Plus size={15} aria-hidden="true" />
+                </button>
+              </span>
             </div>
-          ) : projects.data ? (
-            items.length ? (
-              <ul>
-                {items.map((item) => (
-                  <li key={item.id}>
-                    <button className="project-row" aria-pressed={project?.id === item.id}
-                      title={item.rootPath} onClick={() => { setProjectId(item.id); setFocus(undefined); }}>
-                      <FolderGit2 size={17} aria-hidden="true" className="shrink-0" />
-                      <span className="min-w-0">
-                        <span className="block truncate font-medium" dir="auto">{item.name}</span>
-                        <span className="project-path" dir="ltr">{item.rootPath}</span>
-                      </span>
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            ) : <p className="px-2 pt-2 text-sm text-muted">Sin proyectos registrados.</p>
-          ) : <p className="px-2 pt-2 text-sm text-muted" role="status">Cargando proyectos…</p>}
-        </div>
-        <div className="sidebar-bottom">
-          <button className="button manual-button" disabled={!project}
-            onClick={() => project && setAction({ kind: "manual", project })}>
-            <CircleDot size={15} aria-hidden="true" />Checkpoint Manual
-          </button>
-          <button className="button button-quiet remove-button" disabled={!project}
-            onClick={() => project && setAction({ kind: "remove", project })}>
-            <Trash2 size={14} aria-hidden="true" />Quitar proyecto
-          </button>
-        </div>
+            <div className="project-list">
+              {projects.error ? (
+                <div className="px-3 pt-1" role="alert">
+                  <p className="error-text">{projects.error}</p>
+                  <button className="button mt-2" onClick={() => { setProjects({}); setAttempt(attempt + 1); }}>Reintentar</button>
+                </div>
+              ) : projects.data ? (
+                items.length ? (
+                  <ul aria-labelledby="projects-heading">
+                    {items.map((item) => (
+                      <ProjectRow key={item.id} project={item} active={project?.id === item.id}
+                        onSelect={() => { setProjectId(item.id); setFocus(undefined); }}
+                        onRemove={() => setAction({ kind: "remove", project: item })} />
+                    ))}
+                  </ul>
+                ) : <p className="px-3 text-faint">Sin proyectos.</p>
+              ) : <p className="px-3 text-faint" role="status">Cargando…</p>}
+            </div>
+          </>
+        )}
       </aside>
 
-      <TopBar project={project} view={view} setView={setView} revision={revision}
-        onUndo={(plan) => project && setAction({ kind: "undo", project, plan })} />
-
       {project ? (
-        view === "graph" ? (
-          <GitGraphView key={project.id} project={project} revision={revision} onAction={onGraphAction}
-            onNotice={setNotice}
-            onOpenCheckpoint={(id) => { setFocus(id); setView("timeline"); }} />
-        ) : (
-          <TimelineView key={project.id} project={project} revision={revision} focus={focus} onRefresh={refresh}
-            onRollback={(checkpoint) => setAction({ kind: "rollback", project, checkpoint })} />
-        )
-      ) : (
         <>
-          <main className="pane timeline" aria-labelledby="timeline-heading">
-            <header className="pane-header gap-2.5">
-              <History size={17} className="text-muted" aria-hidden="true" />
-              <h1 id="timeline-heading">Timeline</h1>
-            </header>
-            {projects.data && (
-              <div className="empty-state">
-                <FolderGit2 size={32} aria-hidden="true" />
-                <div><h2>Agrega un repositorio Git</h2><p>Nude registrará sus cambios como checkpoints.</p></div>
-                <div className="flex flex-wrap justify-center gap-2">
-                  <button className="button button-primary" onClick={() => void addFromFinder()}>
-                    <FolderOpen size={16} aria-hidden="true" />Elegir carpeta…
-                  </button>
-                  <button className="button" onClick={() => setAction({ kind: "add" })}>
-                    <ClipboardPaste size={15} aria-hidden="true" />Pegar ruta
-                  </button>
-                </div>
-              </div>
-            )}
-          </main>
-          <DiffInspector />
+          <TopBar project={project} view={view} setView={setView} revision={revision}
+            onUndo={(plan) => setAction({ kind: "undo", project, plan })} />
+          {view === "graph" ? (
+            <GitGraphView key={project.id} project={project} revision={revision} onAction={onGraphAction}
+              onNotice={setNotice}
+              onOpenCheckpoint={(id) => { setFocus(id); setView("timeline"); }} />
+          ) : (
+            <TimelineView key={project.id} project={project} revision={revision} focus={focus} onRefresh={refresh}
+              onRollback={(checkpoint) => setAction({ kind: "rollback", project, checkpoint })}
+              onManual={() => setAction({ kind: "manual", project })} />
+          )}
         </>
+      ) : (
+        <main className="welcome" aria-labelledby="welcome-title">
+          <h1 id="welcome-title" className="sr-only">Nude</h1>
+          <Wordmark height={64} title={null} className="wordmark-faint" />
+          {projects.data && (
+            <button className="button button-compact welcome-button" onClick={() => void addFromFinder()}>
+              <FolderOpen size={14} aria-hidden="true" />Abrir carpeta
+            </button>
+          )}
+        </main>
       )}
       <div className="notice" role="status">{notice && <span key={revision + notice}>{notice}</span>}</div>
       {action && (
