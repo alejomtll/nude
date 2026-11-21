@@ -19,6 +19,9 @@ use serde_json::Value;
 
 use crate::db::models::AgentTool;
 
+/// Donde Claude Code crea los worktrees de cada tarea, relativo al proyecto.
+pub const CLAUDE_WORKTREES_DIR: &str = ".claude/worktrees";
+
 pub const ACTIVE_WINDOW: Duration = Duration::from_secs(15 * 60);
 /// Cuánto del final de un `.jsonl` se lee para buscar modelo y último prompt.
 const TAIL_BYTES: u64 = 1024 * 1024;
@@ -114,7 +117,12 @@ pub fn claude_project_dir_name(root: &Path) -> String {
 fn detect_claude(home: &Path, root: &Path, now: SystemTime, window: Duration) -> Option<(SystemTime, DetectedSession)> {
     let base = home.join(".claude/projects");
     let dir = base.join(claude_project_dir_name(root));
+    // La sesión más reciente entre la del propio proyecto y las de sus
+    // worktrees de Claude Code (`<proyecto>/.claude/worktrees/<tarea>`).
     let (path, modified) = newest_active_file(&dir, "jsonl", now, window)
+        .into_iter()
+        .chain(claude_worktree_sessions(&base, root, now, window))
+        .max_by_key(|(_, modified)| *modified)
         .or_else(|| claude_by_cwd(&base, root, now, window))?;
     let external_id = path.file_stem()?.to_str()?.to_owned();
     let lines = tail_lines(&path)?;
@@ -158,6 +166,34 @@ fn detect_claude(home: &Path, root: &Path, now: SystemTime, window: Duration) ->
     ))
 }
 
+/// `cwd` declarado en las últimas líneas de un `.jsonl` de Claude Code.
+fn claude_session_cwd(path: &Path) -> Option<String> {
+    tail_lines(path)?.iter().rev().find_map(|line| {
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .and_then(|v| v.get("cwd").and_then(Value::as_str).map(str::to_owned))
+    })
+}
+
+/// Sesiones activas de los worktrees que Claude Code crea dentro del proyecto
+/// (`<proyecto>/.claude/worktrees/<tarea>`). Su carpeta en `~/.claude/projects`
+/// es la del proyecto seguida de `--claude-worktrees-<tarea>`; si el historial
+/// trae `cwd`, se confirma que de verdad cae en ese worktree.
+fn claude_worktree_sessions(
+    base: &Path,
+    root: &Path,
+    now: SystemTime,
+    window: Duration,
+) -> Vec<(PathBuf, SystemTime)> {
+    let prefix = format!("{}--claude-worktrees-", claude_project_dir_name(root));
+    sorted_subdirs(base)
+        .iter()
+        .filter(|dir| dir.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&prefix)))
+        .filter_map(|dir| newest_active_file(dir, "jsonl", now, window))
+        .filter(|(path, _)| claude_session_cwd(path).is_none_or(|cwd| path_matches(&cwd, root)))
+        .collect()
+}
+
 /// Plan B: si la carpeta codificada no existe (Claude se lanzó desde un
 /// symlink, una subcarpeta o con `/` final), busca entre las sesiones activas
 /// la que declare un `cwd` que, normalizado, caiga dentro del proyecto.
@@ -165,16 +201,7 @@ fn claude_by_cwd(base: &Path, root: &Path, now: SystemTime, window: Duration) ->
     sorted_subdirs(base)
         .iter()
         .filter_map(|dir| newest_active_file(dir, "jsonl", now, window))
-        .filter(|(path, _)| {
-            tail_lines(path).is_some_and(|lines| {
-                lines.iter().rev().find_map(|line| {
-                    serde_json::from_str::<Value>(line)
-                        .ok()
-                        .and_then(|v| v.get("cwd").and_then(Value::as_str).map(str::to_owned))
-                })
-                .is_some_and(|cwd| path_matches(&cwd, root))
-            })
-        })
+        .filter(|(path, _)| claude_session_cwd(path).is_some_and(|cwd| path_matches(&cwd, root)))
         .max_by_key(|(_, modified)| *modified)
 }
 
@@ -480,9 +507,11 @@ fn sorted_subdirs(dir: &Path) -> Vec<PathBuf> {
 /// tal cual y normalizadas (canónicas, sin `/` final) para que un symlink o una
 /// barra de más no rompan la coincidencia.
 ///
-/// Una subcarpeta que es otro repositorio o un worktree enlazado (tiene su
-/// propio `.git`, como `.claude/worktrees/<tarea>`) **no** cuenta: el agente
-/// trabaja en otro árbol y sus cambios no aparecen en este proyecto.
+/// Los worktrees que Claude Code crea en `<proyecto>/.claude/worktrees/`
+/// cuentan como del proyecto: el agente trabaja ahí y luego fusiona en la
+/// rama del proyecto, y esos cambios deben atribuirse a su sesión. Cualquier
+/// otra subcarpeta que sea un repositorio o worktree aparte (con su propio
+/// `.git`) **no** cuenta: sus cambios no llegan a este proyecto.
 fn path_matches(cwd: &str, root: &Path) -> bool {
     let trimmed = cwd.trim_end_matches('/');
     let raw = Path::new(if trimmed.is_empty() { "/" } else { trimmed });
@@ -493,6 +522,9 @@ fn path_matches(cwd: &str, root: &Path) -> bool {
     };
     if !cwd.starts_with(&root) {
         return false;
+    }
+    if cwd.starts_with(root.join(CLAUDE_WORKTREES_DIR)) {
+        return true;
     }
     !cwd.ancestors()
         .take_while(|dir| *dir != root.as_path())
@@ -639,20 +671,77 @@ mod tests {
     }
 
     #[test]
-    fn sessions_inside_a_nested_worktree_belong_to_the_worktree() {
+    fn claude_worktree_sessions_count_for_the_project_but_other_nested_repos_do_not() {
         let fs_root = Tmp::new();
         let root = fs::canonicalize(&fs_root.0).expect("canon");
         let worktree = root.join(".claude/worktrees/tarea");
-        fs::create_dir_all(&worktree).expect("mkdir");
-        fs::write(worktree.join(".git"), "gitdir: ../../.git/worktrees/tarea\n").expect("git file");
-        assert!(!path_matches(&worktree.display().to_string(), &root));
+        let vendor = root.join("vendor/lib");
+        for repo in [&worktree, &vendor] {
+            fs::create_dir_all(repo).expect("mkdir");
+            fs::write(repo.join(".git"), "gitdir: elsewhere\n").expect("git file");
+        }
+        assert!(path_matches(&worktree.display().to_string(), &root));
+        assert!(path_matches(&format!("{}/src/", worktree.display()), &root));
         assert!(path_matches(&worktree.display().to_string(), &worktree));
+        assert!(!path_matches(&vendor.display().to_string(), &root), "otro repo anidado");
 
+        // Codex: lo mismo por `cwd`.
         let home = Tmp::new();
-        let meta = format!(r#"{{"type":"session_meta","payload":{{"id":"cx-w","cwd":"{}"}}}}"#, worktree.display());
-        home.put(".codex/sessions/2026/11/21/rollout-w.jsonl", &meta);
+        let meta = |id: &str, cwd: &Path| format!(r#"{{"type":"session_meta","payload":{{"id":"{id}","cwd":"{}"}}}}"#, cwd.display());
+        home.put(".codex/sessions/2026/11/21/rollout-v.jsonl", &meta("cx-v", &vendor));
         assert_eq!(detect_active_session(&home.0, &root, SystemTime::now()).tool, AgentTool::Manual);
-        assert_eq!(detect_active_session(&home.0, &worktree, SystemTime::now()).tool, AgentTool::Codex);
+        home.put(".codex/sessions/2026/11/21/rollout-w.jsonl", &meta("cx-w", &worktree));
+        let s = detect_active_session(&home.0, &root, SystemTime::now());
+        assert_eq!((s.tool, s.external_id.as_deref()), (AgentTool::Codex, Some("cx-w")));
+    }
+
+    #[test]
+    fn claude_worktree_session_is_used_unless_the_project_has_a_newer_one() {
+        let fs_root = Tmp::new();
+        let root = fs::canonicalize(&fs_root.0).expect("canon");
+        let worktree = root.join(".claude/worktrees/opus-tarea");
+        fs::create_dir_all(&worktree).expect("mkdir");
+        let home = Tmp::new();
+        let session = |cwd: &Path, model: &str, prompt: &str| {
+            [
+                format!(r#"{{"type":"user","cwd":"{}","message":{{"role":"user","content":"{prompt}"}}}}"#, cwd.display()),
+                format!(r#"{{"type":"assistant","cwd":"{}","message":{{"model":"{model}","content":[]}}}}"#, cwd.display()),
+            ]
+            .join("\n")
+        };
+        let direct = home.put(
+            &format!(".claude/projects/{}/directa.jsonl", claude_project_dir_name(&root)),
+            &session(&root, "claude-sonnet-5-5", "arreglo directo"),
+        );
+        let in_worktree = home.put(
+            &format!(".claude/projects/{}/wt.jsonl", claude_project_dir_name(&worktree)),
+            &session(&worktree, "claude-opus-5-5", "fusiona la rama de la tarea"),
+        );
+        let now = SystemTime::now();
+        let set_age = |path: &Path, secs: u64| {
+            fs::File::options().write(true).open(path).expect("open")
+                .set_modified(now - Duration::from_secs(secs)).expect("mtime");
+        };
+
+        // El worktree es lo más reciente: se atribuye a Claude Code con su modelo y prompt.
+        set_age(&direct, 300);
+        set_age(&in_worktree, 10);
+        let s = detect_active_session(&home.0, &root, now);
+        assert_eq!(s.tool, AgentTool::ClaudeCode);
+        assert_eq!(s.external_id.as_deref(), Some("wt"));
+        assert_eq!(s.model_name.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(s.last_prompt.as_deref(), Some("fusiona la rama de la tarea"));
+        assert_eq!(s.cwd.as_deref(), Some(worktree.to_str().expect("utf8")));
+
+        // Una sesión más reciente en el propio proyecto tiene prioridad.
+        set_age(&direct, 5);
+        let s = detect_active_session(&home.0, &root, now);
+        assert_eq!(s.external_id.as_deref(), Some("directa"));
+        assert_eq!(s.model_name.as_deref(), Some("claude-sonnet-5-5"));
+
+        // Solo el worktree, sin sesión directa: también cuenta.
+        fs::remove_file(&direct).expect("rm");
+        assert_eq!(detect_active_session(&home.0, &root, now).external_id.as_deref(), Some("wt"));
     }
 
     #[test]

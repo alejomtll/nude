@@ -518,12 +518,9 @@ function App() {
   function paletteCommands(): PaletteCommand[] {
     const commands: PaletteCommand[] = [];
     const installed = editors.editors;
+    // ----------------------------------------------------------- Acciones
     if (project) {
       commands.push(
-        { id: "view-timeline", group: "Vista", title: "Timeline de agentes", icon: <ListTree size={14} />,
-          hint: view === "timeline" ? "actual" : undefined, keywords: "checkpoints historial", run: () => setView("timeline") },
-        { id: "view-graph", group: "Vista", title: "Grafo Git", icon: <GitBranch size={14} />,
-          hint: view === "graph" ? "actual" : undefined, keywords: "ramas commits", run: () => setView("graph") },
         { id: "manual", group: "Acciones", title: "Crear checkpoint manual", icon: <BookmarkPlus size={14} />,
           keywords: "guardar snapshot", run: () => setAction({ kind: "manual", project }) },
         { id: "undo", group: "Acciones", title: "Deshacer último agente", icon: <Undo2 size={14} />,
@@ -535,39 +532,45 @@ function App() {
         const name = target.path.split("/").pop() ?? target.path;
         for (const editor of installed) {
           commands.push({
-            id: `file-${editor.id}`, group: "Archivo actual",
+            id: `file-${editor.id}`, group: "Acciones",
             title: editor.id === "finder" ? `Mostrar ${name} en Finder` : `Abrir ${name} en ${editor.name}`,
             hint: target.line ? `línea ${target.line}` : undefined, icon: <FileCode size={14} />,
-            keywords: "editor archivo", run: () => openWith(editor.id, target.path, target.line),
+            keywords: "editor archivo actual", run: () => openWith(editor.id, target.path, target.line),
           });
         }
       }
       for (const editor of installed) {
         commands.push({
-          id: `project-${editor.id}`, group: "Proyecto",
+          id: `project-${editor.id}`, group: "Acciones",
           title: editor.id === "finder" ? "Mostrar proyecto en Finder" : `Abrir proyecto en ${editor.name}`,
           icon: editor.id === "finder" ? <FolderOpen size={14} /> : <Code size={14} />,
           keywords: "editor carpeta", run: () => openWith(editor.id, project.rootPath),
         });
       }
     }
+    commands.push({ id: "add", group: "Acciones", title: "Agregar proyecto…", icon: <Plus size={14} />,
+      keywords: "abrir carpeta finder repositorio", run: () => addFromFinder() });
+
+    // --------------------------------------------------------- Navegación
+    if (project) {
+      commands.push(
+        { id: "view-timeline", group: "Navegación", title: "Timeline de agentes", icon: <ListTree size={14} />,
+          hint: view === "timeline" ? "actual" : undefined, keywords: "vista checkpoints historial", run: () => setView("timeline") },
+        { id: "view-graph", group: "Navegación", title: "Grafo Git", icon: <GitBranch size={14} />,
+          hint: view === "graph" ? "actual" : undefined, keywords: "vista ramas commits", run: () => setView("graph") },
+        { id: "sidebar", group: "Navegación", title: collapsed ? "Mostrar barra lateral" : "Ocultar barra lateral",
+          shortcut: "⌘B", icon: <PanelLeft size={14} />, run: () => setCollapsed((value) => !value) },
+        { id: "home", group: "Navegación", title: "Volver al inicio", icon: <House size={14} />, run: () => selectProject(null) },
+      );
+    }
+
+    // ---------------------------------------------------------- Proyectos
     for (const item of items) {
       if (item.id === project?.id) continue;
       commands.push({
-        id: `switch-${item.id}`, group: "Cambiar de proyecto", title: item.name, icon: <FolderOpen size={14} />,
-        hint: item.rootPath.replace(/^\/Users\/[^/]+/, "~"), keywords: "proyecto ir", run: () => selectProject(item.id),
+        id: `switch-${item.id}`, group: "Proyectos", title: item.name, icon: <FolderOpen size={14} />,
+        hint: item.rootPath.replace(/^\/Users\/[^/]+/, "~"), keywords: "proyecto ir cambiar", run: () => selectProject(item.id),
       });
-    }
-    commands.push(
-      { id: "add", group: "General", title: "Agregar proyecto…", icon: <Plus size={14} />,
-        keywords: "abrir carpeta finder repositorio", run: () => addFromFinder() },
-    );
-    if (project) {
-      commands.push(
-        { id: "sidebar", group: "General", title: collapsed ? "Mostrar barra lateral" : "Ocultar barra lateral",
-          hint: "⌘B", icon: <PanelLeft size={14} />, run: () => setCollapsed((value) => !value) },
-        { id: "home", group: "General", title: "Volver al inicio", icon: <House size={14} />, run: () => selectProject(null) },
-      );
     }
     return commands;
   }
