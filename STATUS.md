@@ -1,7 +1,7 @@
 # Estado del proyecto Nude
 
 > Checklist vivo. Cada agente lo actualiza al terminar una tarea (ver AGENTS.md §5).
-> Última actualización: 2026-11-21 — Correcciones de Fase 6: ⌘K y diagnóstico del watcher.
+> Última actualización: 2026-11-21 — Paleta en portal y atribución de worktrees de Claude Code.
 
 ## Fase 1 — Backend base (Rust) ✅
 
@@ -231,7 +231,7 @@ Solo `src/`; `src-tauri/` sin cambios (IPC, eventos y comandos intactos).
 - [x] Ventana parametrizada: `detect_active_session` = 15 min (checkpoints) y `detect_session_within(…, AGENT_WINDOW = 2 min)` solo para el firewall
 - [x] `cwd` normalizado (`canonicalize` + sin `/` final) al comparar Codex, OpenCode y Claude; se prueba la raíz tal cual y canónica
 - [x] Claude: si la carpeta codificada de `~/.claude/projects` no coincide (symlink, subcarpeta, `/` final), busca entre las sesiones activas la que declare un `cwd` dentro del proyecto
-- [x] Un `cwd` dentro de un repo o worktree anidado (con su propio `.git`, como `.claude/worktrees/<tarea>`) ya no se atribuye al proyecto padre
+- [x] Un `cwd` dentro de un repo o worktree anidado (con su propio `.git`) ya no se atribuye al proyecto padre. *(Fase 6.2: excepto `.claude/worktrees/`, que sí cuenta.)*
 - [x] `DetectedSession.cwd` con la carpeta de trabajo real del agente
 
 ### UI
@@ -247,3 +247,29 @@ Solo `src/`; `src-tauri/` sin cambios (IPC, eventos y comandos intactos).
 
 ### Notas
 - Para registrar el trabajo de un agente en un worktree, hay que vigilar ese worktree como proyecto (botón "Vigilar" del diagnóstico). Sus checkpoints usan las mismas refs internas `refs/nude/checkpoints/…`, compartidas por todos los worktrees del repo.
+
+## Fase 6.2 — Paleta en portal y worktrees de Claude Code ✅
+
+### Paleta de comandos (`src/CommandPalette.tsx`)
+- [x] Ya no usa `<dialog>`: se monta con `createPortal(…, document.body)` en una capa `fixed inset-0 z-50 flex items-start justify-center pt-[14vh] bg-black/60`, fuera de cualquier panel con `overflow` o contexto de apilamiento
+- [x] Caja `w-full max-w-[540px] bg-[#181818] border-[#2E2E2E] rounded-lg shadow-2xl`: input arriba y lista siempre visible con scroll (`max-h-[360px] overflow-y-auto divide-y divide-[#222222]`)
+- [x] Tres grupos en orden fijo: **Acciones** (checkpoint, deshacer agente, firewall, abrir archivo/proyecto en editores, agregar proyecto), **Navegación** (Timeline, Grafo Git, barra lateral `⌘B`, inicio) y **Proyectos** (cambiar de proyecto)
+- [x] Fila seleccionada con `bg-[#262626]` y una marca de 2 px a la izquierda; atajo como `<kbd>` a la derecha y pista (ruta, línea) en mono
+- [x] Teclado: ↑/↓ (⌃N/⌃P), ↵, `Esc`, `Tab` no saca el foco; clic fuera cierra; el foco vuelve a donde estaba al cerrar. Se quitó el CSS antiguo de `.palette`
+
+### Atribución de worktrees (`src-tauri/src/watcher/sessions.rs`)
+> La petición citaba `src-tauri/src/agents/sessions.rs`; ese módulo no existe, la detección vive en `watcher/sessions.rs`.
+- [x] Un `cwd` igual a la raíz del proyecto o dentro de `<proyecto>/.claude/worktrees/` cuenta como del proyecto (Claude Code, Codex y OpenCode). Otros repos anidados con su propio `.git` siguen sin contar
+- [x] Claude Code: además de `~/.claude/projects/<proyecto>`, se miran las carpetas `<proyecto>--claude-worktrees-<tarea>` (confirmando el `cwd` del historial si lo trae). Gana la sesión **más reciente**: si hay una más nueva en la raíz del proyecto, se usa esa
+- [x] Así, tanto el trabajo directo como el merge de un worktree de Claude se registran como `claude-code` con su modelo y su último prompt, no como `manual`
+- [x] El diagnóstico explica que los cambios de un worktree llegan al proyecto al fusionarse; "Vigilar" sigue disponible para ver cada paso del agente dentro del worktree
+
+### Verificación
+- [x] `cargo check --manifest-path src-tauri/Cargo.toml` sin errores ni avisos
+- [x] `cargo test --lib` — 63 pruebas (nuevas: worktree de Claude frente a repo anidado, sesión del worktree con modelo y prompt, prioridad de la sesión más reciente en la raíz y checkpoint del merge atribuido a `claude-code`)
+- [x] `npm run build` sin errores
+- [x] Revisado con IPC simulado: la paleta se ve completa sobre los tres paneles, con grupos, selección, pista y `⌘B`
+- [ ] Probar en `Nude.app` reconstruida desde esta rama
+
+### Notas
+- Mientras un agente trabaja en un worktree de `.claude/worktrees/` (sesión escrita en los últimos 15 min), lo que edites a mano en la raíz del proyecto también se le atribuye. El firewall aplica la misma regla con su ventana de 2 min, así que un merge del agente que toque una ruta protegida se avisa o se revierte.

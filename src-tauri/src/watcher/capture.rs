@@ -548,4 +548,25 @@ mod tests {
         drop(base);
     }
 
+    #[test]
+    fn merging_a_claude_worktree_is_attributed_to_claude_with_model_and_prompt() {
+        let (base, home, db, project) = setup();
+        let root = PathBuf::from(&project.root_path);
+        let worktree = root.join(".claude/worktrees/opus-tarea");
+        let dir = home.0.join(".claude/projects").join(super::super::sessions::claude_project_dir_name(&worktree));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let lines = [
+            format!(r#"{{"type":"user","cwd":"{}","message":{{"role":"user","content":"fusiona la tarea en main"}}}}"#, worktree.display()),
+            format!(r#"{{"type":"assistant","cwd":"{}","message":{{"model":"claude-opus-5-5","content":[]}}}}"#, worktree.display()),
+        ];
+        fs::write(dir.join("wt.jsonl"), lines.join("\n")).expect("session");
+
+        // El merge del worktree cambia el árbol del proyecto.
+        fs::write(root.join("a.txt"), "cambio fusionado\n").expect("write");
+        let cp = capture_if_changed(&db, &home.0, &project, None).expect("capture").expect("checkpoint");
+        assert_eq!(cp.agent_tool, "claude-code");
+        assert_eq!(cp.model_name.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(cp.prompt_summary.as_deref(), Some("fusiona la tarea en main"));
+        drop(base);
+    }
 }

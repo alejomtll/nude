@@ -132,7 +132,7 @@ export function LiveIndicator({ project, live, onNotice, onWatchPath }: {
           {unwatched.length > 0 && (
             <section>
               <h3>Worktrees sin vigilar</h3>
-              <p className="diag-muted">Los agentes que trabajan en un worktree no cambian esta carpeta, así que aquí no se crean checkpoints. Vigílalo como proyecto propio.</p>
+              <p className="diag-muted">Los cambios dentro de un worktree no llegan a esta carpeta hasta que se fusionan (entonces se atribuyen a su agente). Para ver cada paso del agente, vigílalo como proyecto propio.</p>
               <ul className="diag-worktrees">
                 {unwatched.map((worktree) => (
                   <li key={worktree.path}>
