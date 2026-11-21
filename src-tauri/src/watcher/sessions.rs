@@ -30,6 +30,8 @@ pub struct DetectedSession {
     pub external_id: Option<String>,
     pub model_name: Option<String>,
     pub last_prompt: Option<String>,
+    /// Carpeta de trabajo del agente según su historial (normalizada).
+    pub cwd: Option<String>,
 }
 
 impl DetectedSession {
@@ -39,26 +41,63 @@ impl DetectedSession {
             external_id: None,
             model_name: None,
             last_prompt: None,
+            cwd: None,
         }
     }
 }
 
-/// Sesión más recientemente activa para `project_root`, o `manual`.
+/// Ventana de atribución de checkpoints: una sesión escrita en los últimos
+/// 15 min se considera activa. (El firewall usa una propia, mucho más corta.)
 pub fn detect_active_session(home: &Path, project_root: &Path, now: SystemTime) -> DetectedSession {
-    let mut candidates: Vec<(SystemTime, DetectedSession)> = [
-        detect_claude(home, project_root, now),
-        detect_codex(home, project_root, now),
-        detect_opencode(home, project_root, now),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    candidates.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
-    candidates
-        .into_iter()
-        .next()
+    detect_session_within(home, project_root, now, ACTIVE_WINDOW)
+}
+
+/// Sesión más reciente para `project_root` escrita en los últimos `window`, o `manual`.
+pub fn detect_session_within(home: &Path, project_root: &Path, now: SystemTime, window: Duration) -> DetectedSession {
+    latest_session(home, project_root, now, window)
         .map(|(_, s)| s)
         .unwrap_or_else(DetectedSession::manual)
+}
+
+/// Igual, pero con la hora de la última actividad (para el diagnóstico).
+pub fn latest_session(
+    home: &Path,
+    project_root: &Path,
+    now: SystemTime,
+    window: Duration,
+) -> Option<(SystemTime, DetectedSession)> {
+    let roots = root_variants(project_root);
+    let mut candidates: Vec<(SystemTime, DetectedSession)> = roots
+        .iter()
+        .flat_map(|root| {
+            [
+                detect_claude(home, root, now, window),
+                detect_codex(home, root, now, window),
+                detect_opencode(home, root, now, window),
+            ]
+        })
+        .flatten()
+        .collect();
+    candidates.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    candidates.into_iter().next()
+}
+
+/// Ruta comparable: canónica si existe y sin `/` final.
+pub fn normalize_path(path: &Path) -> PathBuf {
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let text = resolved.to_string_lossy();
+    let trimmed = text.trim_end_matches('/');
+    PathBuf::from(if trimmed.is_empty() { "/" } else { trimmed })
+}
+
+/// La raíz tal cual y su forma canónica (p. ej. `/tmp/x` y `/private/tmp/x`):
+/// el agente guarda el `cwd` desde el que lo lanzaste, que puede ser cualquiera.
+fn root_variants(root: &Path) -> Vec<PathBuf> {
+    let text = root.to_string_lossy();
+    let trimmed = text.trim_end_matches('/');
+    let given = PathBuf::from(if trimmed.is_empty() { "/" } else { trimmed });
+    let canonical = normalize_path(root);
+    if canonical == given { vec![given] } else { vec![given, canonical] }
 }
 
 // ------------------------------------------------------------------- Claude
@@ -72,16 +111,22 @@ pub fn claude_project_dir_name(root: &Path) -> String {
         .collect()
 }
 
-fn detect_claude(home: &Path, root: &Path, now: SystemTime) -> Option<(SystemTime, DetectedSession)> {
-    let dir = home.join(".claude/projects").join(claude_project_dir_name(root));
-    let (path, modified) = newest_active_file(&dir, "jsonl", now)?;
+fn detect_claude(home: &Path, root: &Path, now: SystemTime, window: Duration) -> Option<(SystemTime, DetectedSession)> {
+    let base = home.join(".claude/projects");
+    let dir = base.join(claude_project_dir_name(root));
+    let (path, modified) = newest_active_file(&dir, "jsonl", now, window)
+        .or_else(|| claude_by_cwd(&base, root, now, window))?;
     let external_id = path.file_stem()?.to_str()?.to_owned();
     let lines = tail_lines(&path)?;
 
     let mut model = None;
     let mut prompt = None;
+    let mut cwd = None;
     for line in lines.iter().rev() {
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        if cwd.is_none() {
+            cwd = v.get("cwd").and_then(Value::as_str).map(str::to_owned);
+        }
         match v.get("type").and_then(Value::as_str) {
             Some("assistant") if model.is_none() => {
                 model = v
@@ -108,13 +153,34 @@ fn detect_claude(home: &Path, root: &Path, now: SystemTime) -> Option<(SystemTim
             external_id: Some(external_id),
             model_name: model,
             last_prompt: prompt.map(|p| truncate(&p)),
+            cwd: Some(cwd.map_or_else(|| root.display().to_string(), |c| normalize_path(Path::new(&c)).display().to_string())),
         },
     ))
 }
 
+/// Plan B: si la carpeta codificada no existe (Claude se lanzó desde un
+/// symlink, una subcarpeta o con `/` final), busca entre las sesiones activas
+/// la que declare un `cwd` que, normalizado, caiga dentro del proyecto.
+fn claude_by_cwd(base: &Path, root: &Path, now: SystemTime, window: Duration) -> Option<(PathBuf, SystemTime)> {
+    sorted_subdirs(base)
+        .iter()
+        .filter_map(|dir| newest_active_file(dir, "jsonl", now, window))
+        .filter(|(path, _)| {
+            tail_lines(path).is_some_and(|lines| {
+                lines.iter().rev().find_map(|line| {
+                    serde_json::from_str::<Value>(line)
+                        .ok()
+                        .and_then(|v| v.get("cwd").and_then(Value::as_str).map(str::to_owned))
+                })
+                .is_some_and(|cwd| path_matches(&cwd, root))
+            })
+        })
+        .max_by_key(|(_, modified)| *modified)
+}
+
 // -------------------------------------------------------------------- Codex
 
-fn detect_codex(home: &Path, root: &Path, now: SystemTime) -> Option<(SystemTime, DetectedSession)> {
+fn detect_codex(home: &Path, root: &Path, now: SystemTime, window: Duration) -> Option<(SystemTime, DetectedSession)> {
     let base = home.join(".codex/sessions");
     // Solo se miran los últimos días (la estructura es AAAA/MM/DD).
     let mut day_dirs = Vec::new();
@@ -125,7 +191,7 @@ fn detect_codex(home: &Path, root: &Path, now: SystemTime) -> Option<(SystemTime
     }
     day_dirs.sort();
 
-    let mut best: Option<(SystemTime, PathBuf)> = None;
+    let mut best: Option<(SystemTime, PathBuf, String)> = None;
     for dir in day_dirs.iter().rev().take(3) {
         let Ok(entries) = fs::read_dir(dir) else { continue };
         for entry in entries.flatten() {
@@ -133,16 +199,16 @@ fn detect_codex(home: &Path, root: &Path, now: SystemTime) -> Option<(SystemTime
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            let Some(modified) = active_mtime(&path, now) else { continue };
-            if best.as_ref().is_some_and(|(m, _)| *m >= modified) {
+            let Some(modified) = active_mtime(&path, now, window) else { continue };
+            if best.as_ref().is_some_and(|(m, _, _)| *m >= modified) {
                 continue;
             }
-            if codex_cwd(&path).is_some_and(|cwd| path_matches(&cwd, root)) {
-                best = Some((modified, path));
+            if let Some(cwd) = codex_cwd(&path).filter(|cwd| path_matches(cwd, root)) {
+                best = Some((modified, path, cwd));
             }
         }
     }
-    let (modified, path) = best?;
+    let (modified, path, cwd) = best?;
 
     let first = read_first_line(&path)?;
     let meta: Value = serde_json::from_str(&first).ok()?;
@@ -188,6 +254,7 @@ fn detect_codex(home: &Path, root: &Path, now: SystemTime) -> Option<(SystemTime
             external_id,
             model_name: model,
             last_prompt: prompt.map(|p| truncate(&p)),
+            cwd: Some(normalize_path(Path::new(&cwd)).display().to_string()),
         },
     ))
 }
@@ -199,13 +266,13 @@ fn codex_cwd(path: &Path) -> Option<String> {
 
 // ----------------------------------------------------------------- OpenCode
 
-fn detect_opencode(home: &Path, root: &Path, now: SystemTime) -> Option<(SystemTime, DetectedSession)> {
+fn detect_opencode(home: &Path, root: &Path, now: SystemTime, window: Duration) -> Option<(SystemTime, DetectedSession)> {
     let base = home.join(".local/share/opencode");
-    detect_opencode_db(&base.join("opencode.db"), root, now)
-        .or_else(|| detect_opencode_storage(&base.join("storage"), root, now))
+    detect_opencode_db(&base.join("opencode.db"), root, now, window)
+        .or_else(|| detect_opencode_storage(&base.join("storage"), root, now, window))
 }
 
-fn detect_opencode_db(db_path: &Path, root: &Path, now: SystemTime) -> Option<(SystemTime, DetectedSession)> {
+fn detect_opencode_db(db_path: &Path, root: &Path, now: SystemTime, window: Duration) -> Option<(SystemTime, DetectedSession)> {
     if !db_path.is_file() {
         return None;
     }
@@ -213,18 +280,18 @@ fn detect_opencode_db(db_path: &Path, root: &Path, now: SystemTime) -> Option<(S
     conn.busy_timeout(Duration::from_millis(500)).ok()?;
 
     let now_ms = now.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_millis() as i64;
-    let min_ms = now_ms - ACTIVE_WINDOW.as_millis() as i64;
+    let min_ms = now_ms - window.as_millis() as i64;
     let root_str = root.to_string_lossy().into_owned();
     let like = format!("{}/%", root_str.trim_end_matches('/').replace('%', "\\%").replace('_', "\\_"));
 
-    let (id, updated_ms): (String, i64) = conn
+    let (id, updated_ms, directory): (String, i64, String) = conn
         .query_row(
-            "SELECT id, time_updated FROM session
+            "SELECT id, time_updated, directory FROM session
              WHERE (directory = ?1 OR directory LIKE ?2 ESCAPE '\\')
                AND time_updated >= ?3 AND time_archived IS NULL
              ORDER BY time_updated DESC LIMIT 1",
             params![root_str, like, min_ms],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .ok()?;
 
@@ -266,33 +333,31 @@ fn detect_opencode_db(db_path: &Path, root: &Path, now: SystemTime) -> Option<(S
             external_id: Some(id),
             model_name: model,
             last_prompt: prompt.map(|p| truncate(&p)),
+            cwd: Some(normalize_path(Path::new(&directory)).display().to_string()),
         },
     ))
 }
 
 /// Formato anterior de OpenCode: ficheros JSON bajo `storage/`.
-fn detect_opencode_storage(storage: &Path, root: &Path, now: SystemTime) -> Option<(SystemTime, DetectedSession)> {
-    let mut best: Option<(SystemTime, String)> = None;
+fn detect_opencode_storage(storage: &Path, root: &Path, now: SystemTime, window: Duration) -> Option<(SystemTime, DetectedSession)> {
+    let mut best: Option<(SystemTime, String, String)> = None;
     for project_dir in sorted_subdirs(&storage.join("session")) {
         let Ok(entries) = fs::read_dir(&project_dir) else { continue };
         for entry in entries.flatten() {
             let path = entry.path();
-            let Some(modified) = active_mtime(&path, now) else { continue };
-            if best.as_ref().is_some_and(|(m, _)| *m >= modified) {
+            let Some(modified) = active_mtime(&path, now, window) else { continue };
+            if best.as_ref().is_some_and(|(m, _, _)| *m >= modified) {
                 continue;
             }
             let Ok(text) = fs::read_to_string(&path) else { continue };
             let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
-            let dir_matches = v
-                .get("directory")
-                .and_then(Value::as_str)
-                .is_some_and(|d| path_matches(d, root));
-            if let (true, Some(id)) = (dir_matches, v.get("id").and_then(Value::as_str)) {
-                best = Some((modified, id.to_owned()));
+            let directory = v.get("directory").and_then(Value::as_str).filter(|d| path_matches(d, root));
+            if let (Some(directory), Some(id)) = (directory, v.get("id").and_then(Value::as_str)) {
+                best = Some((modified, id.to_owned(), directory.to_owned()));
             }
         }
     }
-    let (modified, id) = best?;
+    let (modified, id, directory) = best?;
 
     let mut model = None;
     let mut prompt = None;
@@ -329,6 +394,7 @@ fn detect_opencode_storage(storage: &Path, root: &Path, now: SystemTime) -> Opti
             external_id: Some(id),
             model_name: model,
             last_prompt: prompt.map(|p| truncate(&p)),
+            cwd: Some(normalize_path(Path::new(&directory)).display().to_string()),
         },
     ))
 }
@@ -385,20 +451,20 @@ fn truncate(text: &str) -> String {
     }
 }
 
-fn active_mtime(path: &Path, now: SystemTime) -> Option<SystemTime> {
+fn active_mtime(path: &Path, now: SystemTime, window: Duration) -> Option<SystemTime> {
     let modified = fs::metadata(path).ok()?.modified().ok()?;
     let age = now.duration_since(modified).unwrap_or_default();
-    (age <= ACTIVE_WINDOW).then_some(modified)
+    (age <= window).then_some(modified)
 }
 
 /// Fichero `*.<ext>` más reciente de `dir` modificado dentro de la ventana activa.
-fn newest_active_file(dir: &Path, ext: &str, now: SystemTime) -> Option<(PathBuf, SystemTime)> {
+fn newest_active_file(dir: &Path, ext: &str, now: SystemTime, window: Duration) -> Option<(PathBuf, SystemTime)> {
     fs::read_dir(dir)
         .ok()?
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some(ext))
-        .filter_map(|p| active_mtime(&p, now).map(|m| (p, m)))
+        .filter_map(|p| active_mtime(&p, now, window).map(|m| (p, m)))
         .max_by_key(|(_, m)| *m)
 }
 
@@ -410,9 +476,27 @@ fn sorted_subdirs(dir: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// `cwd` coincide con la raíz del proyecto o está dentro de ella.
+/// `cwd` coincide con la raíz del proyecto o está dentro de ella. Se comparan
+/// tal cual y normalizadas (canónicas, sin `/` final) para que un symlink o una
+/// barra de más no rompan la coincidencia.
+///
+/// Una subcarpeta que es otro repositorio o un worktree enlazado (tiene su
+/// propio `.git`, como `.claude/worktrees/<tarea>`) **no** cuenta: el agente
+/// trabaja en otro árbol y sus cambios no aparecen en este proyecto.
 fn path_matches(cwd: &str, root: &Path) -> bool {
-    Path::new(cwd).starts_with(root)
+    let trimmed = cwd.trim_end_matches('/');
+    let raw = Path::new(if trimmed.is_empty() { "/" } else { trimmed });
+    let (cwd, root) = if raw.starts_with(root) {
+        (raw.to_path_buf(), root.to_path_buf())
+    } else {
+        (normalize_path(raw), normalize_path(root))
+    };
+    if !cwd.starts_with(&root) {
+        return false;
+    }
+    !cwd.ancestors()
+        .take_while(|dir| *dir != root.as_path())
+        .any(|dir| dir.join(".git").exists())
 }
 
 fn read_first_line(path: &Path) -> Option<String> {
@@ -515,6 +599,60 @@ mod tests {
         home.put(&format!("{dir}/old.jsonl"), r#"{"type":"user","message":{"content":"hola"}}"#);
         let later = SystemTime::now() + ACTIVE_WINDOW + Duration::from_secs(60);
         assert_eq!(detect_active_session(&home.0, &root(), later).tool, AgentTool::Manual);
+    }
+
+    #[test]
+    fn attribution_uses_15_minutes_and_the_firewall_only_2() {
+        let home = Tmp::new();
+        let dir = format!(".claude/projects/{}", claude_project_dir_name(&root()));
+        home.put(&format!("{dir}/s.jsonl"), r#"{"type":"assistant","message":{"model":"m","content":[]}}"#);
+        let ten_minutes_later = SystemTime::now() + Duration::from_secs(10 * 60);
+        assert_eq!(detect_active_session(&home.0, &root(), ten_minutes_later).tool, AgentTool::ClaudeCode);
+        let firewall = detect_session_within(&home.0, &root(), ten_minutes_later, Duration::from_secs(120));
+        assert_eq!(firewall.tool, AgentTool::Manual);
+        let (_, seen) = latest_session(&home.0, &root(), ten_minutes_later, Duration::from_secs(3600)).expect("diag");
+        assert_eq!(seen.cwd.as_deref(), Some(root().to_str().expect("utf8")));
+    }
+
+    #[test]
+    fn cwd_matching_survives_symlinks_trailing_slashes_and_subfolders() {
+        let fs_root = Tmp::new();
+        let real = fs::canonicalize(&fs_root.0).expect("canon").join("real");
+        fs::create_dir_all(real.join("src")).expect("mkdir");
+        let link = fs_root.0.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        assert!(path_matches(&format!("{}/", real.display()), &real));
+        assert!(path_matches(&link.display().to_string(), &real));
+        assert!(path_matches(&format!("{}/src/", link.display()), &real));
+        assert!(!path_matches("/otro", &real));
+
+        // Claude lanzado desde el symlink: su carpeta codificada no coincide con
+        // la raíz canónica, pero el `cwd` del historial sí.
+        let home = Tmp::new();
+        let dir = format!(".claude/projects/{}", claude_project_dir_name(&link.join("src")));
+        let line = format!(r#"{{"type":"assistant","cwd":"{}/src","message":{{"model":"m","content":[]}}}}"#, link.display());
+        home.put(&format!("{dir}/s.jsonl"), &line);
+        let s = detect_active_session(&home.0, &real, SystemTime::now());
+        assert_eq!(s.tool, AgentTool::ClaudeCode);
+        assert_eq!(s.cwd.as_deref(), Some(real.join("src").to_str().expect("utf8")));
+    }
+
+    #[test]
+    fn sessions_inside_a_nested_worktree_belong_to_the_worktree() {
+        let fs_root = Tmp::new();
+        let root = fs::canonicalize(&fs_root.0).expect("canon");
+        let worktree = root.join(".claude/worktrees/tarea");
+        fs::create_dir_all(&worktree).expect("mkdir");
+        fs::write(worktree.join(".git"), "gitdir: ../../.git/worktrees/tarea\n").expect("git file");
+        assert!(!path_matches(&worktree.display().to_string(), &root));
+        assert!(path_matches(&worktree.display().to_string(), &worktree));
+
+        let home = Tmp::new();
+        let meta = format!(r#"{{"type":"session_meta","payload":{{"id":"cx-w","cwd":"{}"}}}}"#, worktree.display());
+        home.put(".codex/sessions/2026/11/21/rollout-w.jsonl", &meta);
+        assert_eq!(detect_active_session(&home.0, &root, SystemTime::now()).tool, AgentTool::Manual);
+        assert_eq!(detect_active_session(&home.0, &worktree, SystemTime::now()).tool, AgentTool::Codex);
     }
 
     #[test]

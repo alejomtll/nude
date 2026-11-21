@@ -4,7 +4,8 @@ use rusqlite::{OptionalExtension, Row, params};
 
 use super::Database;
 use super::models::{
-    AgentSession, AgentTool, ChangeType, Checkpoint, FileDiff, Project, new_id, now_rfc3339,
+    AgentSession, AgentTool, ChangeType, Checkpoint, FileDiff, Guardrail, GuardrailAction, Project,
+    new_id, now_rfc3339,
 };
 use crate::error::{NudeError, NudeResult};
 
@@ -363,6 +364,66 @@ impl Database {
         tx.commit()?;
         Ok(checkpoint)
     }
+
+    // -------------------------------------------------------------- guardrails
+
+    pub fn list_guardrails(&self, project_id: &str) -> NudeResult<Vec<Guardrail>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, pattern, action, created_at FROM project_guardrails
+             WHERE project_id = ?1 ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map(params![project_id], guardrail_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Crea la regla o, si el patrón ya existe en el proyecto, cambia su acción.
+    pub fn upsert_guardrail(
+        &self,
+        project_id: &str,
+        pattern: &str,
+        action: GuardrailAction,
+    ) -> NudeResult<Guardrail> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO project_guardrails (project_id, pattern, action, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (project_id, pattern) DO UPDATE SET action = excluded.action",
+            params![project_id, pattern, action.as_str(), now_rfc3339()],
+        )?;
+        Ok(conn.query_row(
+            "SELECT id, project_id, pattern, action, created_at FROM project_guardrails
+             WHERE project_id = ?1 AND pattern = ?2",
+            params![project_id, pattern],
+            guardrail_from_row,
+        )?)
+    }
+
+    /// Borra la regla y devuelve el proyecto al que pertenecía (`None` si no existía).
+    pub fn delete_guardrail(&self, guardrail_id: i64) -> NudeResult<Option<String>> {
+        let conn = self.lock()?;
+        let project_id: Option<String> = conn
+            .query_row(
+                "SELECT project_id FROM project_guardrails WHERE id = ?1",
+                params![guardrail_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        conn.execute("DELETE FROM project_guardrails WHERE id = ?1", params![guardrail_id])?;
+        Ok(project_id)
+    }
+}
+
+fn guardrail_from_row(row: &Row<'_>) -> rusqlite::Result<Guardrail> {
+    let action: String = row.get("action")?;
+    Ok(Guardrail {
+        id: row.get("id")?,
+        project_id: row.get("project_id")?,
+        pattern: row.get("pattern")?,
+        // El CHECK de la tabla garantiza uno de los dos valores.
+        action: GuardrailAction::parse(&action).unwrap_or(GuardrailAction::Warn),
+        created_at: row.get("created_at")?,
+    })
 }
 
 #[cfg(test)]
@@ -380,7 +441,7 @@ mod tests {
             .expect("version");
         assert_eq!(version, migrations::latest_version());
 
-        for table in ["projects", "agent_sessions", "checkpoints", "file_diffs"] {
+        for table in ["projects", "agent_sessions", "checkpoints", "file_diffs", "project_guardrails"] {
             let exists: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -496,5 +557,35 @@ mod tests {
             params![project.id],
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn guardrails_upsert_list_delete_and_cascade() {
+        let db = Database::open_in_memory().expect("db");
+        let (project, _) = db.upsert_project("demo", "/tmp/demo").expect("project");
+        let env = db.upsert_guardrail(&project.id, ".env*", GuardrailAction::Warn).expect("env");
+        db.upsert_guardrail(&project.id, "migrations/**", GuardrailAction::AutoRevert).expect("mig");
+        // Mismo patrón: cambia la acción, no duplica.
+        let env2 = db.upsert_guardrail(&project.id, ".env*", GuardrailAction::AutoRevert).expect("env2");
+        assert_eq!(env2.id, env.id);
+        assert_eq!(env2.action, GuardrailAction::AutoRevert);
+
+        let rules = db.list_guardrails(&project.id).expect("list");
+        assert_eq!(rules.iter().map(|g| g.pattern.as_str()).collect::<Vec<_>>(), [".env*", "migrations/**"]);
+
+        assert_eq!(db.delete_guardrail(env.id).expect("del").as_deref(), Some(project.id.as_str()));
+        assert_eq!(db.delete_guardrail(env.id).expect("del again"), None);
+
+        let conn = db.lock().expect("lock");
+        let bad = conn.execute(
+            "INSERT INTO project_guardrails (project_id, pattern, action, created_at)
+             VALUES (?1, 'x', 'block', '2026-01-01')",
+            params![project.id],
+        );
+        assert!(bad.is_err(), "acción desconocida");
+        drop(conn);
+
+        db.delete_project(&project.id).expect("delete project");
+        assert!(db.list_guardrails(&project.id).expect("list").is_empty());
     }
 }

@@ -1,16 +1,22 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
-  BookmarkPlus, ClipboardPaste, Ellipsis, FolderOpen, PanelLeftClose, PanelLeftOpen, Plus, RotateCcw, Trash2, Undo2,
+  BookmarkPlus, ClipboardPaste, Code, Command, Ellipsis, FileCode, FolderOpen, GitBranch, House, ListTree,
+  PanelLeft, PanelLeftClose, PanelLeftOpen, Plus, RotateCcw, Shield, Trash2, Undo2,
 } from "lucide-react";
 import { type FormEvent, useEffect, useRef, useState } from "react";
-import { DiffInspector } from "./DiffInspector";
+import { CommandPalette, type PaletteCommand } from "./CommandPalette";
+import { DiffInspector, type Editors } from "./DiffInspector";
 import { type GraphAction, GitGraphView } from "./GitGraphView";
+import { GuardrailToasts, GuardrailsButton } from "./Guardrails";
 import { ProjectLauncher } from "./ProjectLauncher";
+import { LiveIndicator } from "./WatcherStatus";
 import { Wordmark } from "./Wordmark";
 import {
-  agentLabels, cleanPrompt, errorMessage, fileCount, suggestedBranchName, useCheckpoints, useUndoPlan,
-  type Checkpoint, type Project, type Resource, type UndoAgentPlan,
+  agentLabels, cleanPrompt, errorMessage, fileCount, openInEditor, suggestedBranchName, useCheckpoints,
+  useEditors, useGuardrailAlerts, useUndoPlan,
+  type Checkpoint, type OpenTarget, type Project, type Resource, type UndoAgentPlan,
 } from "./workspace";
 import "./App.css";
 
@@ -192,13 +198,19 @@ function ActionDialog({ action, close, submit }: {
   );
 }
 
-function TimelineView({ project, revision, focus, onRefresh, onRollback, onManual }: {
+function TimelineView({
+  project, revision, focus, onRefresh, onRollback, onManual, editors, onTarget, onNotice, onWatchPath,
+}: {
   project: Project;
   revision: number;
   focus?: string;
   onRefresh: () => void;
   onRollback: (checkpoint: Checkpoint) => void;
   onManual: () => void;
+  editors: Editors;
+  onTarget: (target: OpenTarget | null) => void;
+  onNotice: (text: string) => void;
+  onWatchPath: (path: string) => Promise<void>;
 }) {
   const { resource, live } = useCheckpoints(project.id, revision);
   const [selection, setSelection] = useState<string | undefined>(focus);
@@ -221,8 +233,8 @@ function TimelineView({ project, revision, focus, onRefresh, onRollback, onManua
         <header className="pane-header">
           <h1 id="timeline-heading" className="pane-title" title={project.rootPath}>
             {project.name}
-            {live === "on" && <span className="live-label" role="status" title="Recibiendo checkpoints en vivo"><span />en vivo</span>}
           </h1>
+          <LiveIndicator project={project} live={live} onNotice={onNotice} onWatchPath={onWatchPath} />
           <div className="pane-actions">
             {live === "off" && <button className="button button-quiet" onClick={onRefresh}>Reconectar</button>}
             <button className="button button-compact" onClick={onManual} title="Guardar el estado actual como checkpoint">
@@ -281,17 +293,20 @@ function TimelineView({ project, revision, focus, onRefresh, onRollback, onManua
           ) : !resource.error && <div className="empty-state" role="status">Cargando checkpoints…</div>}
         </div>
       </main>
-      <DiffInspector checkpointId={selected?.id} />
+      <DiffInspector checkpointId={selected?.id} projectRoot={project.rootPath} editors={editors} onTarget={onTarget} />
     </>
   );
 }
 
-function TopBar({ view, setView, project, revision, onUndo }: {
+function TopBar({ view, setView, project, revision, onUndo, guardOpen, setGuardOpen, onPalette }: {
   project: Project;
   view: View;
   setView: (view: View) => void;
   revision: number;
   onUndo: (plan: UndoAgentPlan) => void;
+  guardOpen: boolean;
+  setGuardOpen: (open: boolean) => void;
+  onPalette: () => void;
 }) {
   return (
     <header className="topbar">
@@ -303,7 +318,13 @@ function TopBar({ view, setView, project, revision, onUndo }: {
           Grafo Git
         </button>
       </div>
-      <UndoButton key={project.id} project={project} revision={revision} onUndo={onUndo} />
+      <div className="topbar-actions">
+        <button className="palette-trigger" onClick={onPalette} title="Paleta de comandos (⌘K)" aria-label="Paleta de comandos">
+          <Command size={11} aria-hidden="true" />K
+        </button>
+        <GuardrailsButton key={project.id} project={project} open={guardOpen} setOpen={setGuardOpen} />
+        <UndoButton key={`undo-${project.id}`} project={project} revision={revision} onUndo={onUndo} />
+      </div>
     </header>
   );
 }
@@ -398,6 +419,11 @@ function App() {
   const [view, setView] = useState<View>("timeline");
   const [focus, setFocus] = useState<string>();
   const [collapsed, setCollapsed] = useState(readCollapsed);
+  const [palette, setPalette] = useState(false);
+  const [guardOpen, setGuardOpen] = useState(false);
+  const [target, setTarget] = useState<OpenTarget | null>(null);
+  const editors = useEditors();
+  const guardAlerts = useGuardrailAlerts();
   const items = projects.data ?? [];
   const project = items.find((item) => item.id === selectedProjectId);
   const refresh = () => setRevision((current) => current + 1);
@@ -423,6 +449,43 @@ function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [selectedProjectId]);
 
+  // ⌘K abre o cierra la paleta en cualquier pantalla (salvo con un diálogo
+  // abierto). Se escucha en fase de captura para que ningún input ni componente
+  // se lo quede, y también llega por el acelerador del menú nativo
+  // (`open-command-palette`); si llegan los dos, el segundo se descarta.
+  const actionOpen = useRef(false);
+  actionOpen.current = action !== undefined;
+  const lastToggle = useRef(0);
+  useEffect(() => {
+    const toggle = () => {
+      if (actionOpen.current) return;
+      const now = Date.now();
+      if (now - lastToggle.current < 400) return;
+      lastToggle.current = now;
+      setGuardOpen(false);
+      setPalette((open) => !open);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        toggle();
+      }
+    };
+    window.addEventListener("keydown", onKey, { capture: true });
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    void listen("open-command-palette", toggle).then((stop) => {
+      if (active) unlisten = stop;
+      else stop();
+    }, () => undefined);
+    return () => {
+      active = false;
+      unlisten?.();
+      window.removeEventListener("keydown", onKey, { capture: true });
+    };
+  }, []);
+
   useEffect(() => {
     let active = true;
     invoke<Project[]>("list_projects").then(
@@ -434,7 +497,79 @@ function App() {
 
   function selectProject(id: string | null) {
     setFocus(undefined);
+    setGuardOpen(false);
     setSelectedProjectId(id);
+  }
+
+  function openWith(editorId: Parameters<typeof openInEditor>[0], path: string, line: number | null = null) {
+    openInEditor(editorId, path, line).catch((reason: unknown) => setNotice(errorMessage(reason)));
+  }
+
+  async function startUndo(current: Project) {
+    try {
+      const plan = await invoke<UndoAgentPlan | null>("preview_undo_last_agent", { projectId: current.id });
+      if (!plan) setNotice("Todavía no hay sesiones de agentes en este proyecto");
+      else setAction({ kind: "undo", project: current, plan });
+    } catch (reason) {
+      setNotice(errorMessage(reason));
+    }
+  }
+
+  function paletteCommands(): PaletteCommand[] {
+    const commands: PaletteCommand[] = [];
+    const installed = editors.editors;
+    if (project) {
+      commands.push(
+        { id: "view-timeline", group: "Vista", title: "Timeline de agentes", icon: <ListTree size={14} />,
+          hint: view === "timeline" ? "actual" : undefined, keywords: "checkpoints historial", run: () => setView("timeline") },
+        { id: "view-graph", group: "Vista", title: "Grafo Git", icon: <GitBranch size={14} />,
+          hint: view === "graph" ? "actual" : undefined, keywords: "ramas commits", run: () => setView("graph") },
+        { id: "manual", group: "Acciones", title: "Crear checkpoint manual", icon: <BookmarkPlus size={14} />,
+          keywords: "guardar snapshot", run: () => setAction({ kind: "manual", project }) },
+        { id: "undo", group: "Acciones", title: "Deshacer último agente", icon: <Undo2 size={14} />,
+          keywords: "revertir sesión rollback", run: () => startUndo(project) },
+        { id: "guardrails", group: "Acciones", title: "Firewall de archivos…", icon: <Shield size={14} />,
+          keywords: "guardrails proteger bloquear env", run: () => setGuardOpen(true) },
+      );
+      if (target) {
+        const name = target.path.split("/").pop() ?? target.path;
+        for (const editor of installed) {
+          commands.push({
+            id: `file-${editor.id}`, group: "Archivo actual",
+            title: editor.id === "finder" ? `Mostrar ${name} en Finder` : `Abrir ${name} en ${editor.name}`,
+            hint: target.line ? `línea ${target.line}` : undefined, icon: <FileCode size={14} />,
+            keywords: "editor archivo", run: () => openWith(editor.id, target.path, target.line),
+          });
+        }
+      }
+      for (const editor of installed) {
+        commands.push({
+          id: `project-${editor.id}`, group: "Proyecto",
+          title: editor.id === "finder" ? "Mostrar proyecto en Finder" : `Abrir proyecto en ${editor.name}`,
+          icon: editor.id === "finder" ? <FolderOpen size={14} /> : <Code size={14} />,
+          keywords: "editor carpeta", run: () => openWith(editor.id, project.rootPath),
+        });
+      }
+    }
+    for (const item of items) {
+      if (item.id === project?.id) continue;
+      commands.push({
+        id: `switch-${item.id}`, group: "Cambiar de proyecto", title: item.name, icon: <FolderOpen size={14} />,
+        hint: item.rootPath.replace(/^\/Users\/[^/]+/, "~"), keywords: "proyecto ir", run: () => selectProject(item.id),
+      });
+    }
+    commands.push(
+      { id: "add", group: "General", title: "Agregar proyecto…", icon: <Plus size={14} />,
+        keywords: "abrir carpeta finder repositorio", run: () => addFromFinder() },
+    );
+    if (project) {
+      commands.push(
+        { id: "sidebar", group: "General", title: collapsed ? "Mostrar barra lateral" : "Ocultar barra lateral",
+          hint: "⌘B", icon: <PanelLeft size={14} />, run: () => setCollapsed((value) => !value) },
+        { id: "home", group: "General", title: "Volver al inicio", icon: <House size={14} />, run: () => selectProject(null) },
+      );
+    }
+    return commands;
   }
 
   async function addProject(path: string) {
@@ -553,7 +688,8 @@ function App() {
             )}
           </aside>
           <TopBar project={project} view={view} setView={setView} revision={revision}
-            onUndo={(plan) => setAction({ kind: "undo", project, plan })} />
+            onUndo={(plan) => setAction({ kind: "undo", project, plan })}
+            guardOpen={guardOpen} setGuardOpen={setGuardOpen} onPalette={() => setPalette(true)} />
           {view === "graph" ? (
             <GitGraphView key={project.id} project={project} revision={revision} onAction={onGraphAction}
               onNotice={setNotice}
@@ -561,7 +697,9 @@ function App() {
           ) : (
             <TimelineView key={project.id} project={project} revision={revision} focus={focus} onRefresh={refresh}
               onRollback={(checkpoint) => setAction({ kind: "rollback", project, checkpoint })}
-              onManual={() => setAction({ kind: "manual", project })} />
+              onManual={() => setAction({ kind: "manual", project })}
+              editors={editors} onTarget={setTarget} onNotice={setNotice}
+              onWatchPath={(path) => addProject(path)} />
           )}
         </div>
       ) : (
@@ -569,6 +707,9 @@ function App() {
           onOpen={selectProject} onFinder={() => void addFromFinder()} onPaste={() => setAction({ kind: "add" })}
           onRetry={() => { setProjects({}); setAttempt((current) => current + 1); }} />
       )}
+      <GuardrailToasts alerts={guardAlerts.alerts} dismiss={guardAlerts.dismiss}
+        onOpenProject={(id) => { selectProject(id); setView("timeline"); }} />
+      {palette && <CommandPalette commands={paletteCommands()} close={() => setPalette(false)} />}
       <div className="notice" role="status">{notice && <span key={revision + notice}>{notice}</span>}</div>
       {action && (
         <ActionDialog action={action} close={() => setAction(undefined)}

@@ -57,6 +57,18 @@ const MIGRATIONS: &[&str] = &[
         ON agent_sessions(project_id, agent_tool, external_id)
         WHERE external_id IS NOT NULL;
     "#,
+    // v3 — firewall de archivos: rutas protegidas por proyecto (glob relativo a
+    // la raíz) y qué hacer si un agente las toca.
+    r#"
+    CREATE TABLE IF NOT EXISTS project_guardrails (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        pattern     TEXT NOT NULL,
+        action      TEXT NOT NULL CHECK (action IN ('warn', 'auto_revert')),
+        created_at  TEXT NOT NULL,
+        UNIQUE (project_id, pattern)
+    );
+    "#,
 ];
 
 pub fn run(conn: &mut Connection) -> NudeResult<()> {

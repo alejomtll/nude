@@ -17,6 +17,11 @@ use crate::git;
 
 static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
 
+/// El firewall de archivos restaura bajo el mismo bloqueo que las capturas.
+pub(super) fn lock_capture() -> std::sync::MutexGuard<'static, ()> {
+    CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Id del árbol vacío de Git (repositorio sin commits y sin ficheros).
 const EMPTY_TREE_ID: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 

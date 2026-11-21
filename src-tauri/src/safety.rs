@@ -171,6 +171,133 @@ pub fn checkpoint_alerts(db: &Database, checkpoint_id: &str) -> NudeResult<Vec<F
     Ok(alerts)
 }
 
+
+// ------------------------------------------------------------ Guardrails
+
+/// Normaliza el patrón de una regla del firewall: sin `./` ni `/` iniciales y
+/// con `dir/` convertido en `dir/**`. Rechaza patrones vacíos, con `..` o que
+/// apunten dentro de `.git`.
+pub fn normalize_guardrail_pattern(pattern: &str) -> NudeResult<String> {
+    let mut p = pattern.trim().replace('\\', "/");
+    while let Some(rest) = p.strip_prefix("./") {
+        p = rest.to_owned();
+    }
+    let p = p.trim_start_matches('/');
+    let mut p = p.to_owned();
+    if p.ends_with('/') {
+        p.push_str("**");
+    }
+    let invalid = p.is_empty()
+        || p.len() > 200
+        || p.contains('\0')
+        || p.split('/').any(|seg| seg.is_empty() || seg == ".." || seg == "." || seg == ".git");
+    if invalid {
+        return Err(NudeError::GitOperation(format!("patrón no válido: «{}»", pattern.trim())));
+    }
+    Ok(p)
+}
+
+/// `true` si la ruta relativa `rel_path` (separada por `/`) cae bajo `pattern`.
+///
+/// - `*` y `?` no cruzan `/`; `**` como segmento completo abarca 0 o más carpetas.
+/// - Un patrón sin `/` se compara con cada componente de la ruta, como en
+///   `.gitignore`: `.env*` protege `config/.env.local` y `migrations` todo lo
+///   que haya dentro de cualquier carpeta `migrations`.
+/// - Con `/`, el patrón se ancla a la raíz del proyecto (`migrations/**`).
+pub fn guardrail_matches(pattern: &str, rel_path: &str) -> bool {
+    let path: Vec<&str> = rel_path.split('/').filter(|s| !s.is_empty()).collect();
+    if path.is_empty() {
+        return false;
+    }
+    // `dir/` equivale a `dir/**` aunque el patrón no se haya normalizado.
+    let owned;
+    let pattern = if pattern.ends_with('/') {
+        owned = format!("{pattern}**");
+        owned.as_str()
+    } else {
+        pattern
+    };
+    if !pattern.contains('/') {
+        return path.iter().any(|component| segment_matches(pattern.as_bytes(), component.as_bytes()));
+    }
+    let pat: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
+    segments_match(&pat, &path)
+}
+
+fn segments_match(pat: &[&str], path: &[&str]) -> bool {
+    match pat.split_first() {
+        None => path.is_empty(),
+        Some((&"**", rest)) => (0..=path.len()).any(|skip| segments_match(rest, &path[skip..])),
+        Some((first, rest)) => match path.split_first() {
+            Some((component, path_rest)) => {
+                segment_matches(first.as_bytes(), component.as_bytes()) && segments_match(rest, path_rest)
+            }
+            None => false,
+        },
+    }
+}
+
+/// Comodines `*` y `?` dentro de un solo segmento (sin `/`).
+fn segment_matches(pat: &[u8], text: &[u8]) -> bool {
+    let (mut p, mut t) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        if p < pat.len() && (pat[p] == b'?' || pat[p] == text[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pat.len() && pat[p] == b'*' {
+            star = Some((p, t));
+            p += 1;
+        } else if let Some((sp, st)) = star {
+            p = sp + 1;
+            t = st + 1;
+            star = Some((sp, st + 1));
+        } else {
+            return false;
+        }
+    }
+    while p < pat.len() && pat[p] == b'*' {
+        p += 1;
+    }
+    p == pat.len()
+}
+
+#[cfg(test)]
+mod guardrail_tests {
+    use super::*;
+
+    #[test]
+    fn glob_semantics_follow_gitignore_style_rules() {
+        assert!(guardrail_matches(".env*", ".env"));
+        assert!(guardrail_matches(".env*", "config/.env.local"));
+        assert!(!guardrail_matches(".env*", "src/env.ts"));
+        assert!(guardrail_matches("Cargo.lock", "src-tauri/Cargo.lock"));
+        assert!(guardrail_matches("*.lock", "yarn.lock"));
+        assert!(guardrail_matches("migrations", "db/migrations/001.sql"));
+
+        assert!(guardrail_matches("migrations/**", "migrations/001_init.sql"));
+        assert!(guardrail_matches("migrations/**", "migrations/a/b.sql"));
+        assert!(guardrail_matches("migrations/", "migrations/a/b.sql"));
+        assert!(!guardrail_matches("migrations/**", "db/migrations/001.sql"), "anclado a la raíz");
+        assert!(guardrail_matches("**/migrations/**", "db/migrations/001.sql"));
+        assert!(guardrail_matches("**/migrations/**", "migrations/001.sql"));
+        assert!(guardrail_matches("src/*.rs", "src/main.rs"));
+        assert!(!guardrail_matches("src/*.rs", "src/db/mod.rs"), "* no cruza carpetas");
+        assert!(guardrail_matches("src/**/*.rs", "src/db/mod.rs"));
+        assert!(guardrail_matches("file?.txt", "file1.txt"));
+        assert!(!guardrail_matches("file?.txt", "file10.txt"));
+    }
+
+    #[test]
+    fn patterns_are_normalized_and_validated() {
+        assert_eq!(normalize_guardrail_pattern("  ./migrations/ ").expect("ok"), "migrations/**");
+        assert_eq!(normalize_guardrail_pattern("/Cargo.lock").expect("ok"), "Cargo.lock");
+        for bad in ["", "   ", "../secret", "a//b", ".git/config", "a/./b"] {
+            assert!(normalize_guardrail_pattern(bad).is_err(), "{bad:?} debería rechazarse");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

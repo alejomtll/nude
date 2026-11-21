@@ -48,3 +48,32 @@ pub(super) fn path_to_string(path: &Path) -> NudeResult<String> {
         .map(str::to_owned)
         .ok_or_else(|| NudeError::NonUtf8Path(PathBuf::from(path).display().to_string()))
 }
+
+/// Worktree enlazado (`git worktree add`, o los que crean Claude Code / Codex
+/// para cada tarea). Sus cambios **no** aparecen en el árbol del proyecto.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkedWorktree {
+    pub path: String,
+    pub branch: Option<String>,
+}
+
+/// Worktrees enlazados del repositorio de `root` que siguen existiendo.
+pub fn linked_worktrees(root: &Path) -> NudeResult<Vec<LinkedWorktree>> {
+    let repo = open_worktree(root)?;
+    let own = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut result = Vec::new();
+    for name in repo.worktrees()?.iter().flatten().flatten() {
+        let Ok(worktree) = repo.find_worktree(name) else { continue };
+        let Ok(path) = std::fs::canonicalize(worktree.path()) else { continue };
+        if path == own {
+            continue;
+        }
+        let branch = Repository::open_from_worktree(&worktree)
+            .ok()
+            .and_then(|r| r.head().ok().and_then(|h| h.shorthand().ok().map(str::to_owned)));
+        result.push(LinkedWorktree { path: path_to_string(&path)?, branch });
+    }
+    result.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(result)
+}
