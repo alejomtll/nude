@@ -8,6 +8,7 @@ pub mod checkpoints;
 pub mod editor;
 pub mod git;
 pub mod guardrails;
+pub mod preview;
 pub mod projects;
 pub mod watcher;
 

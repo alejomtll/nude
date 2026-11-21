@@ -2,6 +2,7 @@ mod commands;
 mod db;
 mod error;
 mod git;
+mod preview;
 mod safety;
 mod watcher;
 
@@ -75,15 +76,18 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()?;
             let database = db::Database::open_in_app_dir(&data_dir)?;
 
+            if let Err(error) = database.prune_previews() {
+                eprintln!("nude: no se pudieron limpiar las capturas huérfanas: {error}");
+            }
+            app.manage(preview::PreviewService::new(database.clone()));
+
             // Vigilancia de los proyectos ya registrados + checkpoints automáticos.
             let home = app.path().home_dir()?;
             let projects = database.list_projects()?;
             let handle = app.handle().clone();
             let watcher_handle = watcher::start(database.clone(), home.clone(), projects, move |event| match event {
                 watcher::WatcherEvent::Checkpoint(checkpoint) => {
-                    if let Err(e) = handle.emit(watcher::EVENT_CHECKPOINT_CREATED, checkpoint) {
-                        eprintln!("nude: no se pudo emitir checkpoint-created: {e}");
-                    }
+                    commands::checkpoints::emit_checkpoint(&handle, checkpoint);
                 }
                 watcher::WatcherEvent::Guardrail(alert) => {
                     if let Err(e) = handle.emit(watcher::EVENT_GUARDRAIL_TRIGGERED, alert) {
@@ -126,6 +130,9 @@ pub fn run() {
             commands::watcher::get_watcher_diagnostics,
             commands::watcher::get_watcher_status,
             commands::watcher::force_scan,
+            commands::preview::set_project_preview_url,
+            commands::preview::capture_checkpoint_preview,
+            commands::preview::get_checkpoint_preview,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

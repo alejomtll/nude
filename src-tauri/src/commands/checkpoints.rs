@@ -1,4 +1,4 @@
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use super::blocking;
 use crate::db::Database;
@@ -23,10 +23,16 @@ pub async fn create_manual_checkpoint(
     Ok(checkpoint)
 }
 
-pub(super) fn emit_checkpoint(app: &AppHandle, checkpoint: &Checkpoint) {
+pub(crate) fn emit_checkpoint(app: &AppHandle, checkpoint: &Checkpoint) {
     if let Err(e) = app.emit(EVENT_CHECKPOINT_CREATED, checkpoint) {
         eprintln!("nude: no se pudo emitir {EVENT_CHECKPOINT_CREATED}: {e}");
     }
+    let service = app.state::<crate::preview::PreviewService>().inner().clone();
+    let (app, project, checkpoint) = (app.clone(), checkpoint.project_id.clone(), checkpoint.id.clone());
+    tauri::async_runtime::spawn(async move {
+        // Una URL desactivada o fuera de servicio no afecta a los checkpoints.
+        let _ = service.capture(&app, project, checkpoint).await;
+    });
 }
 
 /// Ficheros cambiados por un checkpoint (respecto al checkpoint anterior del

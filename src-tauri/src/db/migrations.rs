@@ -69,6 +69,16 @@ const MIGRATIONS: &[&str] = &[
         UNIQUE (project_id, pattern)
     );
     "#,
+    // v4 — configuración del servidor local y miniaturas de checkpoints.
+    r#"
+    ALTER TABLE projects ADD COLUMN preview_url TEXT;
+    CREATE TABLE checkpoint_previews (
+        checkpoint_id TEXT PRIMARY KEY NOT NULL REFERENCES checkpoints(id) ON DELETE CASCADE,
+        image_path    TEXT NOT NULL,
+        captured_at   INTEGER NOT NULL,
+        url           TEXT NOT NULL
+    );
+    "#,
 ];
 
 pub fn run(conn: &mut Connection) -> NudeResult<()> {
@@ -109,7 +119,7 @@ mod tests {
 
     #[test]
     fn opening_application_data_preserves_history_after_upgrade_and_reopen() {
-        for prior_version in [0, 1] {
+        for prior_version in [0, 1, 3] {
             let root = TestDirectory(std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()));
             let data_dir = root.0.join("Application Support/com.nude.app");
             fs::create_dir_all(&data_dir).expect("application data directory");
@@ -117,11 +127,16 @@ mod tests {
             {
                 let old = Connection::open(&path).expect("old database");
                 old.execute_batch(MIGRATIONS[0]).expect("base schema");
+                if prior_version == 3 {
+                    for sql in &MIGRATIONS[1..3] {
+                        old.execute_batch(sql).expect("existing schema v3");
+                    }
+                }
                 old.pragma_update(None, "user_version", prior_version)
                     .expect("old schema version");
                 old.execute_batch(
                     "INSERT INTO projects VALUES ('p1', 'Demo', '/demo', '2026-01-01');
-                     INSERT INTO agent_sessions VALUES
+                     INSERT INTO agent_sessions (id, project_id, agent_tool, model_name, started_at, ended_at) VALUES
                         ('s1', 'p1', 'codex', 'gpt', '2026-01-01', NULL);
                      INSERT INTO checkpoints VALUES
                         ('c1', 's1', 'p1', 'refs/nude/checkpoints/s1/a', 'Resumen', 1, '2026-01-01');
@@ -136,6 +151,7 @@ mod tests {
                 let projects = db.list_projects().expect("projects");
                 assert_eq!(projects.len(), 1);
                 assert_eq!(projects[0].root_path, "/demo");
+                assert_eq!(projects[0].preview_url, None);
 
                 let checkpoints = db.list_checkpoints("p1").expect("checkpoints");
                 assert_eq!(checkpoints.len(), 1);
@@ -151,7 +167,15 @@ mod tests {
                     .expect("database lock")
                     .pragma_query_value(None, "user_version", |row| row.get(0))
                     .expect("migrated schema version");
-                assert_eq!(version, latest_version());
+                assert_eq!(version, 4);
+                let count: i64 = db
+                    .lock()
+                    .expect("database lock")
+                    .query_row("SELECT COUNT(*) FROM checkpoint_previews", [], |row| {
+                        row.get(0)
+                    })
+                    .expect("preview table");
+                assert_eq!(count, 0);
             }
         }
     }

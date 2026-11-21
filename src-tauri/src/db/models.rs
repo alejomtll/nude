@@ -9,6 +9,7 @@ pub struct Project {
     pub id: String,
     pub name: String,
     pub root_path: String,
+    pub preview_url: Option<String>,
     pub created_at: String,
 }
 

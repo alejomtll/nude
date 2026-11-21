@@ -10,6 +10,8 @@ import { CommandPalette, type PaletteCommand } from "./CommandPalette";
 import { DiffInspector, type Editors } from "./DiffInspector";
 import { type GraphAction, GitGraphView } from "./GitGraphView";
 import { GuardrailToasts, GuardrailsButton } from "./Guardrails";
+import { PreviewButton } from "./Preview";
+import { TimeScrubber } from "./TimeScrubber";
 import { ProjectLauncher } from "./ProjectLauncher";
 import { LiveIndicator } from "./WatcherStatus";
 import { Wordmark } from "./Wordmark";
@@ -243,6 +245,14 @@ function TimelineView({
           </div>
         </header>
 
+        {selected && (
+          <TimeScrubber checkpoints={checkpoints} selected={selected} onRestore={onRollback}
+            onSelect={(checkpoint) => {
+              setSelection(checkpoint.id);
+              document.getElementById(`checkpoint-${checkpoint.id}`)?.scrollIntoView({ block: "nearest" });
+            }} />
+        )}
+
         <div className="timeline-scroll">
           {resource.error && (
             <div className="inline-error" role="alert">
@@ -293,12 +303,12 @@ function TimelineView({
           ) : !resource.error && <div className="empty-state" role="status">Cargando checkpoints…</div>}
         </div>
       </main>
-      <DiffInspector checkpointId={selected?.id} projectRoot={project.rootPath} editors={editors} onTarget={onTarget} />
+      <DiffInspector projectId={project.id} checkpointId={selected?.id} projectRoot={project.rootPath} editors={editors} onTarget={onTarget} />
     </>
   );
 }
 
-function TopBar({ view, setView, project, revision, onUndo, guardOpen, setGuardOpen, onPalette }: {
+function TopBar({ view, setView, project, revision, onUndo, guardOpen, setGuardOpen, onPalette, onPreviewUrl }: {
   project: Project;
   view: View;
   setView: (view: View) => void;
@@ -307,6 +317,7 @@ function TopBar({ view, setView, project, revision, onUndo, guardOpen, setGuardO
   guardOpen: boolean;
   setGuardOpen: (open: boolean) => void;
   onPalette: () => void;
+  onPreviewUrl: (url: string | null) => void;
 }) {
   return (
     <header className="topbar">
@@ -323,6 +334,7 @@ function TopBar({ view, setView, project, revision, onUndo, guardOpen, setGuardO
           <Command size={11} aria-hidden="true" />K
         </button>
         <GuardrailsButton key={project.id} project={project} open={guardOpen} setOpen={setGuardOpen} />
+        <PreviewButton key={project.id} project={project} onUrl={onPreviewUrl} />
         <UndoButton key={`undo-${project.id}`} project={project} revision={revision} onUndo={onUndo} />
       </div>
     </header>
@@ -692,7 +704,10 @@ function App() {
           </aside>
           <TopBar project={project} view={view} setView={setView} revision={revision}
             onUndo={(plan) => setAction({ kind: "undo", project, plan })}
-            guardOpen={guardOpen} setGuardOpen={setGuardOpen} onPalette={() => setPalette(true)} />
+            guardOpen={guardOpen} setGuardOpen={setGuardOpen} onPalette={() => setPalette(true)}
+            onPreviewUrl={(previewUrl) => setProjects((previous) => ({
+              ...previous, data: previous.data?.map((item) => item.id === project.id ? { ...item, previewUrl } : item),
+            }))} />
           {view === "graph" ? (
             <GitGraphView key={project.id} project={project} revision={revision} onAction={onGraphAction}
               onNotice={setNotice}

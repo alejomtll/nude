@@ -1,7 +1,7 @@
 # Estado del proyecto Nude
 
 > Checklist vivo. Cada agente lo actualiza al terminar una tarea (ver AGENTS.md §5).
-> Última actualización: 2026-11-21 — Paleta en portal y atribución de worktrees de Claude Code.
+> Última actualización: 2026-11-21 — Fase 7, historial visual y Live Preview.
 
 ## Fase 1 — Backend base (Rust) ✅
 
@@ -273,3 +273,15 @@ Solo `src/`; `src-tauri/` sin cambios (IPC, eventos y comandos intactos).
 
 ### Notas
 - Mientras un agente trabaja en un worktree de `.claude/worktrees/` (sesión escrita en los últimos 15 min), lo que edites a mano en la raíz del proyecto también se le atribuye. El firewall aplica la misma regla con su ventana de 2 min, así que un merge del agente que toque una ruta protegida se avisa o se revierte.
+
+## Fase 7 — Time-Travel Scrubber y Live Preview ✅
+
+- [x] Migración transaccional v4 con `projects.preview_url` y `checkpoint_previews` asociado por clave foránea al checkpoint. Los PNG se guardan en `~/Library/Application Support/com.nude.app/previews/<project_id>/<checkpoint_id>.png`.
+- [x] `set_project_preview_url`, `capture_checkpoint_preview`, `get_checkpoint_preview` y evento `preview-captured`. Al quitar un proyecto se limpia su directorio de capturas. Al arrancar se retiran PNG huérfanos de checkpoints borrados y archivos temporales interrumpidos.
+- [x] Captura automática en segundo plano con hasta 800 ms para comprobar el puerto. WebKit nativo usa una ventana oculta, un almacén de sesión temporal y reglas de origen para los recursos. Las URLs se limitan a HTTP/HTTPS en loopback. Nude usa el servidor que ya ejecuta el usuario.
+- [x] El PNG tiene un ancho máximo de 960 px. Se guarda si el checkpoint sigue siendo el más reciente del proyecto, el árbol de trabajo coincide con él y la URL sigue configurada. Un servidor apagado deja el checkpoint disponible sin captura.
+- [x] Popover Preview con guardado de URL y accesos a los puertos 5173, 3000, 4321 y 8080. «Capturar ahora» asocia el resultado al último checkpoint.
+- [x] Scrubber cronológico con arrastre y flechas, hora exacta, agente y modelo. La selección actualiza el diff y la miniatura expandible. «Restaurar este estado» reutiliza la confirmación de rollback.
+- [x] `cargo check --manifest-path src-tauri/Cargo.toml`, `cargo test --lib` (68 pruebas) y `npm run build` sin errores. Las pruebas cubren actualización desde v3, configuración, puerto cerrado, persistencia y limpieza de capturas.
+- [x] WebKit generó un PNG de 960 × 600 con HTML sintético. Verificados con IPC simulado el scrubber, el diff, la confirmación de rollback, la configuración y expansión de la captura.
+- [ ] Prueba integral en la app empaquetada con un servidor de desarrollo real ya iniciado.

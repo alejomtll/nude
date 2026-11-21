@@ -6,6 +6,7 @@ export interface Project {
   id: string;
   name: string;
   rootPath: string;
+  previewUrl: string | null;
 }
 
 export type AgentTool = "claude-code" | "codex" | "opencode" | "manual";

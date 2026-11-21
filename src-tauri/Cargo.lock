@@ -2437,6 +2437,8 @@ dependencies = [
 name = "nude"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
+ "cc",
  "chrono",
  "git2",
  "notify",

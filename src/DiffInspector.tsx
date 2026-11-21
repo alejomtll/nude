@@ -6,6 +6,8 @@ import {
   type FileAlert, type FileDiff, type OpenTarget, type Resource,
 } from "./workspace";
 
+import { CheckpointPreview } from "./Preview";
+
 export type Editors = ReturnType<typeof useEditors>;
 
 const changes = {
@@ -292,12 +294,15 @@ function CheckpointDiffs({ checkpointId, projectRoot, editors, onTarget }: { che
   );
 }
 
-export function DiffInspector({ checkpointId, ...context }: { checkpointId?: string } & InspectorContext) {
+export function DiffInspector({ projectId, checkpointId, ...context }: { projectId?: string; checkpointId?: string } & InspectorContext) {
   return (
     <aside className="inspector pane" aria-labelledby="inspector-heading">
       <header className="pane-header">
         <h2 id="inspector-heading" className="pane-title">Cambios</h2>
       </header>
+      {checkpointId && projectId && (
+        <CheckpointPreview key={checkpointId} projectId={projectId} checkpointId={checkpointId} />
+      )}
       {checkpointId ? <CheckpointDiffs key={checkpointId} checkpointId={checkpointId} {...context} /> : (
         <div className="empty-state">
           <p>Selecciona un checkpoint para ver sus cambios.</p>

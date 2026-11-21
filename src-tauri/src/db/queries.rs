@@ -18,6 +18,7 @@ fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
         id: row.get("id")?,
         name: row.get("name")?,
         root_path: row.get("root_path")?,
+        preview_url: row.get("preview_url")?,
         created_at: row.get("created_at")?,
     })
 }
@@ -62,7 +63,7 @@ impl Database {
             params![new_id(), name, root_path, now_rfc3339()],
         )?;
         let project = conn.query_row(
-            "SELECT id, name, root_path, created_at FROM projects WHERE root_path = ?1",
+            "SELECT id, name, root_path, created_at, preview_url FROM projects WHERE root_path = ?1",
             params![root_path],
             project_from_row,
         )?;
@@ -72,7 +73,7 @@ impl Database {
     pub fn list_projects(&self) -> NudeResult<Vec<Project>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, root_path, created_at FROM projects
+            "SELECT id, name, root_path, created_at, preview_url FROM projects
              ORDER BY name COLLATE NOCASE, created_at",
         )?;
         let rows = stmt.query_map([], project_from_row)?;
@@ -83,7 +84,7 @@ impl Database {
         let conn = self.lock()?;
         Ok(conn
             .query_row(
-                "SELECT id, name, root_path, created_at FROM projects WHERE id = ?1",
+                "SELECT id, name, root_path, created_at, preview_url FROM projects WHERE id = ?1",
                 params![project_id],
                 project_from_row,
             )
@@ -93,6 +94,9 @@ impl Database {
     pub fn delete_project(&self, project_id: &str) -> NudeResult<()> {
         let conn = self.lock()?;
         conn.execute("DELETE FROM projects WHERE id = ?1", params![project_id])?;
+        if let Err(error) = self.cleanup_project_previews(project_id) {
+            eprintln!("nude: no se pudieron limpiar las capturas del proyecto: {error}");
+        }
         Ok(())
     }
 

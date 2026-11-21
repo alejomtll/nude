@@ -6,9 +6,11 @@
 
 mod migrations;
 pub mod models;
+mod previews;
+pub use previews::{MAX_PREVIEW_BYTES, PreviewInfo};
 mod queries;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -23,6 +25,7 @@ const DB_FILE_NAME: &str = "nude.db";
 #[derive(Clone)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
+    preview_dir: Option<Arc<PathBuf>>,
 }
 
 impl Database {
@@ -31,16 +34,16 @@ impl Database {
     pub fn open_in_app_dir(data_dir: &Path) -> NudeResult<Self> {
         std::fs::create_dir_all(data_dir)?;
         let conn = Connection::open(data_dir.join(DB_FILE_NAME))?;
-        Self::init(conn)
+        Self::init(conn, Some(data_dir.join("previews")))
     }
 
     /// Base de datos en memoria (tests).
     #[cfg(test)]
     pub fn open_in_memory() -> NudeResult<Self> {
-        Self::init(Connection::open_in_memory()?)
+        Self::init(Connection::open_in_memory()?, None)
     }
 
-    fn init(mut conn: Connection) -> NudeResult<Self> {
+    fn init(mut conn: Connection, preview_dir: Option<PathBuf>) -> NudeResult<Self> {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
@@ -50,6 +53,7 @@ impl Database {
         migrations::run(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            preview_dir: preview_dir.map(Arc::new),
         })
     }
 
