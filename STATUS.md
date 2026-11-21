@@ -1,7 +1,7 @@
 # Estado del proyecto Nude
 
 > Checklist vivo. Cada agente lo actualiza al terminar una tarea (ver AGENTS.md §5).
-> Última actualización: 2026-11-20 — Rediseño visual neutro (Fase 5).
+> Última actualización: 2026-11-20 — Pantalla inicial de proyectos.
 
 ## Fase 1 — Backend base (Rust) ✅
 
@@ -160,3 +160,10 @@ Solo `src/`; `src-tauri/` sin cambios (IPC, eventos y comandos intactos).
 - [x] `npm run build` sin errores
 - [x] Revisado en navegador con el IPC simulado: timeline con prompts Markdown, alertas, diff, grafo, menú `···`, sidebar colapsado y pantalla de bienvenida
 - [ ] Revisar en la app Tauri real (fuentes del sistema, selector de Finder)
+
+## Pantalla inicial de proyectos ✅
+
+- [x] Nude se abre sin proyecto seleccionado. El inicio muestra el wordmark geométrico de 288 px en `#2A2A2A` sobre `#121212` y la lista de proyectos con rutas truncadas en monoespaciado.
+- [x] Desde el inicio se puede abrir un proyecto registrado, elegir una carpeta en Finder o pegar una ruta con el diálogo existente.
+- [x] Abrir un proyecto muestra el espacio de trabajo de tres paneles. El wordmark del sidebar vuelve al inicio incluso con la barra colapsada.
+- [x] `npm run build` sin errores. Verificados con IPC simulado el inicio, la apertura, el regreso en ambos estados de la barra lateral, el diálogo de ruta y la selección o cancelación en Finder.

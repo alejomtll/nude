@@ -140,7 +140,15 @@ button:disabled { opacity: .4; }
   padding: 0 7px 0 14px;
 }
 .workspace[data-sidebar="collapsed"] .sidebar-header { justify-content: center; padding: 0; }
-.sidebar-wordmark { color: var(--faint); }
+.workspace[data-sidebar="collapsed"] .sidebar-wordmark { align-self: center; }
+.sidebar-wordmark {
+  display: grid;
+  place-items: center;
+  min-height: 26px;
+  color: var(--faint);
+  border-radius: 4px;
+}
+.sidebar-wordmark:hover, .sidebar-wordmark:focus-visible { color: var(--ink); }
 .sidebar-section {
   display: flex;
   align-items: center;
@@ -249,20 +257,59 @@ button:disabled { opacity: .4; }
   font-size: 11px;
 }
 
-/* ---------------------------------------------------------------- welcome */
+/* --------------------------------------------------------------- launcher */
 
-.welcome {
-  grid-column: 2 / 4;
-  grid-row: 1 / 3;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 28px;
+.launcher {
+  min-height: 100vh;
+  padding: clamp(32px, 26vh, 240px) 20px 32px;
   background: var(--bg);
 }
+.launcher-wordmark {
+  width: min(100%, 288px);
+  height: auto;
+  margin-inline: auto;
+  color: #2a2a2a;
+}
+.launcher-projects {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+.launcher-list {
+  max-height: min(32vh, 280px);
+  overflow: auto;
+}
+.launcher-list li + li { border-top: 1px solid var(--rule); }
+.launcher-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 9px 12px;
+  text-align: start;
+}
+.launcher-row:hover { background: var(--raised); }
+.launcher-row:focus-visible { outline-offset: -2px; }
+.launcher-path { color: var(--muted); font-size: 11px; }
+.launcher-open {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.launcher-row:hover .launcher-open, .launcher-row:focus-visible .launcher-open { color: var(--ink); }
+.launcher-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  padding: 6px;
+  border-top: 1px solid var(--line);
+}
 .wordmark-faint { color: var(--mark); }
-.welcome-button { min-height: 28px; padding-inline: 12px; }
 
 /* --------------------------------------------------------------- timeline */
 

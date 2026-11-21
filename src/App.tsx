@@ -6,6 +6,7 @@ import {
 import { type FormEvent, useEffect, useRef, useState } from "react";
 import { DiffInspector } from "./DiffInspector";
 import { type GraphAction, GitGraphView } from "./GitGraphView";
+import { ProjectLauncher } from "./ProjectLauncher";
 import { Wordmark } from "./Wordmark";
 import {
   agentLabels, cleanPrompt, errorMessage, fileCount, suggestedBranchName, useCheckpoints, useUndoPlan,
@@ -389,7 +390,7 @@ function readCollapsed() {
 
 function App() {
   const [projects, setProjects] = useState<Resource<Project[]>>({});
-  const [projectId, setProjectId] = useState<string>();
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [action, setAction] = useState<Action>();
   const [attempt, setAttempt] = useState(0);
   const [revision, setRevision] = useState(0);
@@ -398,7 +399,7 @@ function App() {
   const [focus, setFocus] = useState<string>();
   const [collapsed, setCollapsed] = useState(readCollapsed);
   const items = projects.data ?? [];
-  const project = items.find((item) => item.id === projectId) ?? items[0];
+  const project = items.find((item) => item.id === selectedProjectId);
   const refresh = () => setRevision((current) => current + 1);
   const announce = (text: string) => { setNotice(text); refresh(); };
 
@@ -411,6 +412,7 @@ function App() {
   }, [collapsed]);
 
   useEffect(() => {
+    if (selectedProjectId === null) return;
     const onKey = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "b") {
         event.preventDefault();
@@ -419,7 +421,7 @@ function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [selectedProjectId]);
 
   useEffect(() => {
     let active = true;
@@ -430,13 +432,18 @@ function App() {
     return () => { active = false; };
   }, [attempt]);
 
+  function selectProject(id: string | null) {
+    setFocus(undefined);
+    setSelectedProjectId(id);
+  }
+
   async function addProject(path: string) {
     const { project: added, created } = await invoke<{ project: Project; created: boolean }>("add_project", { path: path.trim() });
     setProjects(({ data = [] }) => ({
       data: [...data.filter((item) => item.id !== added.id), added]
         .sort((a, b) => a.name.localeCompare(b.name, "es", { sensitivity: "base" })),
     }));
-    setProjectId(added.id);
+    selectProject(added.id);
     setNotice(created ? "Proyecto agregado" : "Proyecto seleccionado");
   }
 
@@ -467,7 +474,7 @@ function App() {
       case "remove":
         await invoke("remove_project", { projectId: action.project.id });
         setProjects(({ data = [] }) => ({ data: data.filter((item) => item.id !== action.project.id) }));
-        setProjectId(undefined);
+        setSelectedProjectId((current) => current === action.project.id ? null : current);
         setNotice("Proyecto quitado");
         break;
       case "manual":
@@ -497,56 +504,54 @@ function App() {
     }
   }
 
+  const homeButton = (
+    <button className="sidebar-wordmark" aria-label="Nude · Volver al inicio"
+      title="Volver al inicio" onClick={() => selectProject(null)}>
+      <Wordmark height={collapsed ? 7 : 11} title={null} />
+    </button>
+  );
+
   return (
-    <div className="workspace" data-sidebar={collapsed ? "collapsed" : "open"}>
-      <aside className="sidebar pane" aria-label="Proyectos">
-        <header className="sidebar-header">
-          {!collapsed && <Wordmark height={11} className="sidebar-wordmark" />}
-          <button className="icon-button" onClick={() => setCollapsed((value) => !value)}
-            aria-label={collapsed ? "Mostrar barra lateral" : "Ocultar barra lateral"}
-            title={`${collapsed ? "Mostrar" : "Ocultar"} barra lateral (⌘B)`} aria-expanded={!collapsed}>
-            {collapsed ? <PanelLeftOpen size={15} aria-hidden="true" /> : <PanelLeftClose size={15} aria-hidden="true" />}
-          </button>
-        </header>
-        {!collapsed && (
-          <>
-            <div className="sidebar-section">
-              <h2 id="projects-heading">Proyectos</h2>
-              <span className="flex">
-                <button className="icon-button" aria-label="Pegar ruta de un proyecto" title="Pegar ruta"
-                  disabled={!projects.data} onClick={() => setAction({ kind: "add" })}>
-                  <ClipboardPaste size={13} aria-hidden="true" />
-                </button>
-                <button className="icon-button" aria-label="Abrir carpeta en Finder" title="Abrir carpeta (Finder)"
-                  disabled={!projects.data} onClick={() => void addFromFinder()}>
-                  <Plus size={15} aria-hidden="true" />
-                </button>
-              </span>
-            </div>
-            <div className="project-list">
-              {projects.error ? (
-                <div className="px-3 pt-1" role="alert">
-                  <p className="error-text">{projects.error}</p>
-                  <button className="button mt-2" onClick={() => { setProjects({}); setAttempt(attempt + 1); }}>Reintentar</button>
+    <>
+      {project ? (
+        <div className="workspace" data-sidebar={collapsed ? "collapsed" : "open"}>
+          <aside className="sidebar pane" aria-label="Proyectos">
+            <header className="sidebar-header">
+              {!collapsed && homeButton}
+              <button className="icon-button" onClick={() => setCollapsed((value) => !value)}
+                aria-label={collapsed ? "Mostrar barra lateral" : "Ocultar barra lateral"}
+                title={`${collapsed ? "Mostrar" : "Ocultar"} barra lateral (⌘B)`} aria-expanded={!collapsed}>
+                {collapsed ? <PanelLeftOpen size={15} aria-hidden="true" /> : <PanelLeftClose size={15} aria-hidden="true" />}
+              </button>
+            </header>
+            {collapsed && homeButton}
+            {!collapsed && (
+              <>
+                <div className="sidebar-section">
+                  <h2 id="projects-heading">Proyectos</h2>
+                  <span className="flex">
+                    <button className="icon-button" aria-label="Pegar ruta de un proyecto" title="Pegar ruta"
+                      onClick={() => setAction({ kind: "add" })}>
+                      <ClipboardPaste size={13} aria-hidden="true" />
+                    </button>
+                    <button className="icon-button" aria-label="Abrir carpeta en Finder" title="Abrir carpeta (Finder)"
+                      onClick={() => void addFromFinder()}>
+                      <Plus size={15} aria-hidden="true" />
+                    </button>
+                  </span>
                 </div>
-              ) : projects.data ? (
-                items.length ? (
+                <div className="project-list">
                   <ul aria-labelledby="projects-heading">
                     {items.map((item) => (
-                      <ProjectRow key={item.id} project={item} active={project?.id === item.id}
-                        onSelect={() => { setProjectId(item.id); setFocus(undefined); }}
+                      <ProjectRow key={item.id} project={item} active={project.id === item.id}
+                        onSelect={() => selectProject(item.id)}
                         onRemove={() => setAction({ kind: "remove", project: item })} />
                     ))}
                   </ul>
-                ) : <p className="px-3 text-faint">Sin proyectos.</p>
-              ) : <p className="px-3 text-faint" role="status">Cargando…</p>}
-            </div>
-          </>
-        )}
-      </aside>
-
-      {project ? (
-        <>
+                </div>
+              </>
+            )}
+          </aside>
           <TopBar project={project} view={view} setView={setView} revision={revision}
             onUndo={(plan) => setAction({ kind: "undo", project, plan })} />
           {view === "graph" ? (
@@ -558,24 +563,18 @@ function App() {
               onRollback={(checkpoint) => setAction({ kind: "rollback", project, checkpoint })}
               onManual={() => setAction({ kind: "manual", project })} />
           )}
-        </>
+        </div>
       ) : (
-        <main className="welcome" aria-labelledby="welcome-title">
-          <h1 id="welcome-title" className="sr-only">Nude</h1>
-          <Wordmark height={64} title={null} className="wordmark-faint" />
-          {projects.data && (
-            <button className="button button-compact welcome-button" onClick={() => void addFromFinder()}>
-              <FolderOpen size={14} aria-hidden="true" />Abrir carpeta
-            </button>
-          )}
-        </main>
+        <ProjectLauncher projects={projects}
+          onOpen={selectProject} onFinder={() => void addFromFinder()} onPaste={() => setAction({ kind: "add" })}
+          onRetry={() => { setProjects({}); setAttempt((current) => current + 1); }} />
       )}
       <div className="notice" role="status">{notice && <span key={revision + notice}>{notice}</span>}</div>
       {action && (
         <ActionDialog action={action} close={() => setAction(undefined)}
           submit={(value, flag) => perform(action, value, flag)} />
       )}
-    </div>
+    </>
   );
 }
 
