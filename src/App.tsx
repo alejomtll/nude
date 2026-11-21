@@ -5,7 +5,8 @@ import {
   BookmarkPlus, ClipboardPaste, Code, Command, Ellipsis, FileCode, FolderOpen, GitBranch, House, ListTree,
   PanelLeft, PanelLeftClose, PanelLeftOpen, Plus, RotateCcw, Shield, Trash2, Undo2,
 } from "lucide-react";
-import { type FormEvent, useEffect, useRef, useState } from "react";
+import { memo, type FormEvent, useCallback, useDeferredValue, useEffect, useRef, useState } from "react";
+import { useCheckpointDetailsCache, type CheckpointDetails } from "./checkpointDetails";
 import { CommandPalette, type PaletteCommand } from "./CommandPalette";
 import { DiffInspector, type Editors } from "./DiffInspector";
 import { type GraphAction, GitGraphView } from "./GitGraphView";
@@ -200,12 +201,49 @@ function ActionDialog({ action, close, submit }: {
   );
 }
 
+const CheckpointRow = memo(function CheckpointRow({ checkpoint, now, isSelected, onSelect, onRollback }: {
+  checkpoint: Checkpoint;
+  now: number;
+  isSelected: boolean;
+  onSelect: (id: string) => void;
+  onRollback: (checkpoint: Checkpoint) => void;
+}) {
+  const prompt = cleanPrompt(checkpoint.promptSummary);
+  const date = fullDate.format(Date.parse(checkpoint.createdAt));
+  return (
+    <li id={`checkpoint-${checkpoint.id}`} className="checkpoint-row"
+      data-agent={checkpoint.agentTool} data-selected={isSelected}>
+      <button className="checkpoint-select" aria-pressed={isSelected}
+        onClick={() => onSelect(checkpoint.id)}>
+        <span className="checkpoint-meta">
+          <span className="agent-dot" aria-hidden="true" />
+          <span className="agent-name">{agentLabels[checkpoint.agentTool]}</span>
+          {checkpoint.modelName && (
+            <span className="model-name" title={checkpoint.modelName}>{checkpoint.modelName}</span>
+          )}
+          <span className="checkpoint-files">{fileCount(checkpoint.filesChangedCount)}</span>
+          <time dateTime={checkpoint.createdAt} title={date}>{timeAgo(checkpoint.createdAt, now)}</time>
+        </span>
+        <span className="checkpoint-summary" dir="auto" title={prompt || undefined}>
+          {prompt || <span className="text-faint">Sin resumen</span>}
+        </span>
+      </button>
+      <button className="row-action-button" onClick={() => onRollback(checkpoint)}
+        title="Restaurar los archivos a este checkpoint"
+        aria-label={`Rollback al checkpoint del ${date}`}>
+        <RotateCcw size={12} aria-hidden="true" />Rollback
+      </button>
+    </li>
+  );
+});
+
 function TimelineView({
-  project, revision, focus, onRefresh, onRollback, onManual, editors, onTarget, onNotice, onWatchPath,
+  project, revision, focus, cache, onRefresh, onRollback, onManual, editors, onTarget, onNotice, onWatchPath,
 }: {
   project: Project;
   revision: number;
   focus?: string;
+  cache: CheckpointDetails;
   onRefresh: () => void;
   onRollback: (checkpoint: Checkpoint) => void;
   onManual: () => void;
@@ -216,9 +254,16 @@ function TimelineView({
 }) {
   const { resource, live } = useCheckpoints(project.id, revision);
   const [selection, setSelection] = useState<string | undefined>(focus);
+  const [scrubbed, setScrubbed] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const [settled, setSettled] = useState<string>();
   const [now, setNow] = useState(Date.now);
 
-  useEffect(() => { if (focus) setSelection(focus); }, [focus]);
+  const selectRow = useCallback((id: string) => {
+    setScrubbed(false);
+    setSelection(id);
+  }, []);
+  useEffect(() => { if (focus) selectRow(focus); }, [focus, selectRow]);
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 30_000);
     return () => window.clearInterval(timer);
@@ -229,6 +274,17 @@ function TimelineView({
 
   const checkpoints = resource.data ?? [];
   const selected = checkpoints.find((item) => item.id === selection) ?? checkpoints[0];
+  const selectedId = selected?.id;
+  const inspectorId = useDeferredValue(selectedId);
+  useEffect(() => {
+    if (!selectedId || !scrubbed || dragging) return;
+    const timer = window.setTimeout(() => {
+      setSettled(selectedId);
+      document.getElementById(`checkpoint-${selectedId}`)?.scrollIntoView({ block: "nearest" });
+    }, 150);
+    return () => window.clearTimeout(timer);
+  }, [selectedId, scrubbed, dragging]);
+
   return (
     <>
       <main className="timeline pane" aria-labelledby="timeline-heading">
@@ -247,9 +303,11 @@ function TimelineView({
 
         {selected && (
           <TimeScrubber checkpoints={checkpoints} selected={selected} onRestore={onRollback}
+            onDraggingChange={setDragging}
             onSelect={(checkpoint) => {
+              setScrubbed(true);
+              setSettled(undefined);
               setSelection(checkpoint.id);
-              document.getElementById(`checkpoint-${checkpoint.id}`)?.scrollIntoView({ block: "nearest" });
             }} />
         )}
 
@@ -263,36 +321,10 @@ function TimelineView({
           {resource.data ? (
             checkpoints.length ? (
               <ol className="checkpoint-list" aria-label="Checkpoints, del más reciente al más antiguo">
-                {checkpoints.map((checkpoint) => {
-                  const prompt = cleanPrompt(checkpoint.promptSummary);
-                  const isSelected = checkpoint.id === selected?.id;
-                  const date = fullDate.format(Date.parse(checkpoint.createdAt));
-                  return (
-                    <li key={checkpoint.id} id={`checkpoint-${checkpoint.id}`} className="checkpoint-row"
-                      data-agent={checkpoint.agentTool} data-selected={isSelected}>
-                      <button className="checkpoint-select" aria-pressed={isSelected}
-                        onClick={() => setSelection(checkpoint.id)}>
-                        <span className="checkpoint-meta">
-                          <span className="agent-dot" aria-hidden="true" />
-                          <span className="agent-name">{agentLabels[checkpoint.agentTool]}</span>
-                          {checkpoint.modelName && (
-                            <span className="model-name" title={checkpoint.modelName}>{checkpoint.modelName}</span>
-                          )}
-                          <span className="checkpoint-files">{fileCount(checkpoint.filesChangedCount)}</span>
-                          <time dateTime={checkpoint.createdAt} title={date}>{timeAgo(checkpoint.createdAt, now)}</time>
-                        </span>
-                        <span className="checkpoint-summary" dir="auto" title={prompt || undefined}>
-                          {prompt || <span className="text-faint">Sin resumen</span>}
-                        </span>
-                      </button>
-                      <button className="row-action-button" onClick={() => onRollback(checkpoint)}
-                        title="Restaurar los archivos a este checkpoint"
-                        aria-label={`Rollback al checkpoint del ${date}`}>
-                        <RotateCcw size={12} aria-hidden="true" />Rollback
-                      </button>
-                    </li>
-                  );
-                })}
+                {checkpoints.map((checkpoint) => (
+                  <CheckpointRow key={checkpoint.id} checkpoint={checkpoint} now={now}
+                    isSelected={checkpoint.id === selectedId} onSelect={selectRow} onRollback={onRollback} />
+                ))}
               </ol>
             ) : (
               <div className="empty-state watermark">
@@ -303,7 +335,9 @@ function TimelineView({
           ) : !resource.error && <div className="empty-state" role="status">Cargando checkpoints…</div>}
         </div>
       </main>
-      <DiffInspector projectId={project.id} checkpointId={selected?.id} projectRoot={project.rootPath} editors={editors} onTarget={onTarget} />
+      <DiffInspector projectId={project.id} checkpointId={inspectorId} cache={cache}
+        ready={inspectorId === selectedId && !dragging && (!scrubbed || settled === selectedId)}
+        projectRoot={project.rootPath} editors={editors} onTarget={onTarget} />
     </>
   );
 }
@@ -333,9 +367,9 @@ function TopBar({ view, setView, project, revision, onUndo, guardOpen, setGuardO
         <button className="palette-trigger" onClick={onPalette} title="Paleta de comandos (⌘K)" aria-label="Paleta de comandos">
           <Command size={11} aria-hidden="true" />K
         </button>
-        <GuardrailsButton key={project.id} project={project} open={guardOpen} setOpen={setGuardOpen} />
-        <PreviewButton key={project.id} project={project} onUrl={onPreviewUrl} />
-        <UndoButton key={`undo-${project.id}`} project={project} revision={revision} onUndo={onUndo} />
+        <GuardrailsButton project={project} open={guardOpen} setOpen={setGuardOpen} />
+        <PreviewButton project={project} onUrl={onPreviewUrl} />
+        <UndoButton project={project} revision={revision} onUndo={onUndo} />
       </div>
     </header>
   );
@@ -436,8 +470,12 @@ function App() {
   const [target, setTarget] = useState<OpenTarget | null>(null);
   const editors = useEditors();
   const guardAlerts = useGuardrailAlerts();
+  const checkpointCache = useCheckpointDetailsCache();
   const items = projects.data ?? [];
   const project = items.find((item) => item.id === selectedProjectId);
+  const confirmRollback = useCallback((checkpoint: Checkpoint) => {
+    if (project) setAction({ kind: "rollback", project, checkpoint });
+  }, [project]);
   const refresh = () => setRevision((current) => current + 1);
   const announce = (text: string) => { setNotice(text); refresh(); };
 
@@ -702,7 +740,7 @@ function App() {
               </>
             )}
           </aside>
-          <TopBar project={project} view={view} setView={setView} revision={revision}
+          <TopBar key={`topbar:${project.id}`} project={project} view={view} setView={setView} revision={revision}
             onUndo={(plan) => setAction({ kind: "undo", project, plan })}
             guardOpen={guardOpen} setGuardOpen={setGuardOpen} onPalette={() => setPalette(true)}
             onPreviewUrl={(previewUrl) => setProjects((previous) => ({
@@ -713,8 +751,8 @@ function App() {
               onNotice={setNotice}
               onOpenCheckpoint={(id) => { setFocus(id); setView("timeline"); }} />
           ) : (
-            <TimelineView key={project.id} project={project} revision={revision} focus={focus} onRefresh={refresh}
-              onRollback={(checkpoint) => setAction({ kind: "rollback", project, checkpoint })}
+            <TimelineView key={project.id} project={project} cache={checkpointCache} revision={revision} focus={focus} onRefresh={refresh}
+              onRollback={confirmRollback}
               onManual={() => setAction({ kind: "manual", project })}
               editors={editors} onTarget={setTarget} onNotice={setNotice}
               onWatchPath={(path) => addProject(path)} />

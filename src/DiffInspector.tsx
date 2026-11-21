@@ -1,11 +1,11 @@
-import { invoke } from "@tauri-apps/api/core";
 import { ChevronDown, KeyRound, Repeat2, SquareArrowOutUpRight, TriangleExclamationPoint } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   errorMessage, fileCount, joinPath, openInEditor, useEditors,
-  type FileAlert, type FileDiff, type OpenTarget, type Resource,
+  type FileAlert, type FileDiff, type OpenTarget,
 } from "./workspace";
 
+import { type CheckpointDetails } from "./checkpointDetails";
 import { CheckpointPreview } from "./Preview";
 
 export type Editors = ReturnType<typeof useEditors>;
@@ -198,13 +198,13 @@ interface InspectorContext {
   onTarget: (target: OpenTarget | null) => void;
 }
 
-function CheckpointDiffs({ checkpointId, projectRoot, editors, onTarget }: { checkpointId: string } & InspectorContext) {
-  const [resource, setResource] = useState<Resource<FileDiff[]>>({});
-  const [alerts, setAlerts] = useState<FileAlert[]>([]);
+function CheckpointDiffs({ files, alerts, projectRoot, editors, onTarget }: {
+  files: FileDiff[];
+  alerts: FileAlert[];
+} & InspectorContext) {
   const [selected, setSelected] = useState<number>(0);
-  const [attempt, setAttempt] = useState(0);
   const [openError, setOpenError] = useState("");
-  const file = resource.data?.[selected];
+  const file = files[selected];
   const target = useMemo<OpenTarget | null>(() => (
     file && file.changeType !== "deleted"
       ? { path: joinPath(projectRoot, file.filePath), line: firstChangedLine(file.patchText) }
@@ -214,33 +214,6 @@ function CheckpointDiffs({ checkpointId, projectRoot, editors, onTarget }: { che
   useEffect(() => { onTarget(target); setOpenError(""); }, [target, onTarget]);
   useEffect(() => () => onTarget(null), [onTarget]);
 
-  useEffect(() => {
-    let active = true;
-    invoke<FileDiff[]>("get_checkpoint_diffs", { checkpointId }).then(
-      (data) => { if (active) setResource({ data }); },
-      (error: unknown) => { if (active) setResource({ error: errorMessage(error) }); },
-    );
-    // Los avisos son complementarios: si fallan, el inspector sigue funcionando.
-    invoke<FileAlert[]>("get_checkpoint_alerts", { checkpointId }).then(
-      (data) => { if (active) setAlerts(data); },
-      () => { if (active) setAlerts([]); },
-    );
-    return () => { active = false; };
-  }, [checkpointId, attempt]);
-
-  if (resource.error) {
-    return (
-      <div className="empty-state" role="alert">
-        <p>{resource.error}</p>
-        <button className="button mt-3" onClick={() => { setResource({}); setAttempt(attempt + 1); }}>
-          Reintentar
-        </button>
-      </div>
-    );
-  }
-
-  const files = resource.data;
-  if (!files) return <div className="empty-state" role="status">Cargando cambios…</div>;
   if (!file) return <div className="empty-state">Este checkpoint no tiene cambios de archivos.</div>;
 
   const alertsByFile = new Map<string, FileAlert[]>();
@@ -294,20 +267,38 @@ function CheckpointDiffs({ checkpointId, projectRoot, editors, onTarget }: { che
   );
 }
 
-export function DiffInspector({ projectId, checkpointId, ...context }: { projectId?: string; checkpointId?: string } & InspectorContext) {
+export const DiffInspector = memo(function DiffInspector({ projectId, checkpointId, cache, ready, ...context }: {
+  projectId: string;
+  checkpointId?: string;
+  cache: CheckpointDetails;
+  ready: boolean;
+} & InspectorContext) {
+  const data = useSyncExternalStore(cache.subscribe, () => cache.get(checkpointId));
+
+  useEffect(() => {
+    if (ready && checkpointId) cache.load(projectId, checkpointId);
+  }, [cache, ready, projectId, checkpointId, data.previewVersion]);
+
   return (
     <aside className="inspector pane" aria-labelledby="inspector-heading">
       <header className="pane-header">
         <h2 id="inspector-heading" className="pane-title">Cambios</h2>
       </header>
-      {checkpointId && projectId && (
-        <CheckpointPreview key={checkpointId} projectId={projectId} checkpointId={checkpointId} />
-      )}
-      {checkpointId ? <CheckpointDiffs key={checkpointId} checkpointId={checkpointId} {...context} /> : (
-        <div className="empty-state">
-          <p>Selecciona un checkpoint para ver sus cambios.</p>
+      {data.preview && <CheckpointPreview key={`preview:${checkpointId}`} image={data.preview} />}
+      {data.files ? (
+        <CheckpointDiffs key={`diffs:${checkpointId}`} files={data.files} alerts={data.alerts ?? []} {...context} />
+      ) : data.error && checkpointId ? (
+        <div className="empty-state" role="alert">
+          <p>{data.error}</p>
+          <button className="button mt-3" onClick={() => cache.retry(projectId, checkpointId)}
+            disabled={!ready}>Reintentar</button>
+        </div>
+      ) : (
+        <div className="empty-state" role="status">
+          <p>{checkpointId ? ready ? "Cargando cambios…" : "Seleccionando checkpoint…" :
+            "Selecciona un checkpoint para ver sus cambios."}</p>
         </div>
       )}
     </aside>
   );
-}
+});

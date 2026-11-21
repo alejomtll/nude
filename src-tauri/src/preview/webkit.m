@@ -27,7 +27,7 @@ typedef void (*NudePreviewCallback)(void *, const unsigned char *, size_t);
     self.callback(self.context, png.bytes, png.length);
 }
 
-- (void)startWithRules:(NSString *)rules {
+- (void)startWithRules:(NSString *)rules settleScript:(NSString *)settleScript {
     // El timeout también libera la ventana si WebKit deja de responder.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 6 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         [self finish:nil];
@@ -57,6 +57,8 @@ typedef void (*NudePreviewCallback)(void *, const unsigned char *, size_t);
           @"try{Object.defineProperty(navigator,'serviceWorker',{value:undefined,configurable:false});}catch(_){}";
         [config.userContentController addUserScript:[[WKUserScript alloc] initWithSource:isolation
             injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO]];
+        [config.userContentController addUserScript:[[WKUserScript alloc] initWithSource:settleScript
+            injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:YES]];
 
         NSRect frame = NSMakeRect(0, 0, 1280, 800);
         capture.window = [[NSWindow alloc] initWithContentRect:frame styleMask:NSWindowStyleMaskBorderless
@@ -104,52 +106,70 @@ typedef void (*NudePreviewCallback)(void *, const unsigned char *, size_t);
     [self finish:nil];
 }
 
+- (void)takePreviewSnapshot {
+    if (self.finished) return;
+    __weak NudePreview *weakSelf = self;
+    WKSnapshotConfiguration *options = [WKSnapshotConfiguration new];
+    options.rect = self.webView.bounds;
+    options.snapshotWidth = @960;
+    [self.webView takeSnapshotWithConfiguration:options completionHandler:^(NSImage *image, NSError *error) {
+        NudePreview *pending = weakSelf;
+        if (!pending || pending.finished) return;
+        if (!image || error || image.size.width <= 0 || image.size.height <= 0) {
+            [pending finish:nil];
+            return;
+        }
+        // NSImage puede tener una representación Retina más grande que snapshotWidth.
+        NSInteger width = MIN(960, ceil(image.size.width));
+        NSInteger height = MAX(1, MIN(960, ceil(image.size.height * width / image.size.width)));
+        NSBitmapImageRep *bitmap = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL
+            pixelsWide:width pixelsHigh:height bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO
+            colorSpaceName:NSDeviceRGBColorSpace bytesPerRow:0 bitsPerPixel:0];
+        NSGraphicsContext *graphics = [NSGraphicsContext graphicsContextWithBitmapImageRep:bitmap];
+        if (!graphics) {
+            [pending finish:nil];
+            return;
+        }
+        [NSGraphicsContext saveGraphicsState];
+        NSGraphicsContext.currentContext = graphics;
+        graphics.imageInterpolation = NSImageInterpolationHigh;
+        [image drawInRect:NSMakeRect(0, 0, width, height)];
+        [NSGraphicsContext restoreGraphicsState];
+        [pending finish:[bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}]];
+    }];
+}
+
 - (void)webView:(WKWebView *)view didFinishNavigation:(WKNavigation *)navigation {
     if (self.finished || self.snapshotPending) return;
     self.snapshotPending = YES;
     __weak NudePreview *weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 350 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 700 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
         NudePreview *capture = weakSelf;
         if (!capture || capture.finished) return;
-        WKSnapshotConfiguration *options = [WKSnapshotConfiguration new];
-        options.rect = capture.webView.bounds;
-        options.snapshotWidth = @960;
-        [capture.webView takeSnapshotWithConfiguration:options completionHandler:^(NSImage *image, NSError *error) {
-            NudePreview *pending = weakSelf;
-            if (!pending || pending.finished) return;
-            if (!image || error || image.size.width <= 0 || image.size.height <= 0) {
-                [pending finish:nil];
-                return;
-            }
-            // NSImage puede tener una representación Retina más grande que snapshotWidth.
-            NSInteger width = MIN(960, ceil(image.size.width));
-            NSInteger height = MAX(1, MIN(960, ceil(image.size.height * width / image.size.width)));
-            NSBitmapImageRep *bitmap = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL
-                pixelsWide:width pixelsHigh:height bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO
-                colorSpaceName:NSDeviceRGBColorSpace bytesPerRow:0 bitsPerPixel:0];
-            NSGraphicsContext *graphics = [NSGraphicsContext graphicsContextWithBitmapImageRep:bitmap];
-            if (!graphics) {
-                [pending finish:nil];
-                return;
-            }
-            [NSGraphicsContext saveGraphicsState];
-            NSGraphicsContext.currentContext = graphics;
-            graphics.imageInterpolation = NSImageInterpolationHigh;
-            [image drawInRect:NSMakeRect(0, 0, width, height)];
-            [NSGraphicsContext restoreGraphicsState];
-            [pending finish:[bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}]];
+        [capture.webView evaluateJavaScript:@"globalThis.__nudePrepareCapture?.()"
+            completionHandler:^(__unused id value, __unused NSError *error) {
+            // Da tiempo al trabajo que los observadores y listeners programaron.
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+                NudePreview *pending = weakSelf;
+                if (!pending || pending.finished) return;
+                [pending.webView evaluateJavaScript:@"globalThis.__nudeFinishCaptureAnimations?.()"
+                    completionHandler:^(__unused id value, __unused NSError *error) {
+                        [weakSelf takePreviewSnapshot];
+                    }];
+            });
         }];
     });
 }
 
 @end
 
-void nude_capture_preview(const char *url, const char *rules, void *context, NudePreviewCallback callback) {
+void nude_capture_preview(const char *url, const char *rules, const char *settleScript, void *context, NudePreviewCallback callback) {
     @autoreleasepool {
         NudePreview *capture = [NudePreview new];
         capture.url = [NSURL URLWithString:[NSString stringWithUTF8String:url]];
         capture.context = context;
         capture.callback = callback;
-        [capture startWithRules:[NSString stringWithUTF8String:rules]];
+        [capture startWithRules:[NSString stringWithUTF8String:rules]
+            settleScript:[NSString stringWithUTF8String:settleScript]];
     }
 }

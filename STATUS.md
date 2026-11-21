@@ -1,7 +1,7 @@
 # Estado del proyecto Nude
 
 > Checklist vivo. Cada agente lo actualiza al terminar una tarea (ver AGENTS.md §5).
-> Última actualización: 2026-11-21 — Fase 7, historial visual y Live Preview.
+> Última actualización: 2026-11-21 — Fase 7.1, correcciones del historial visual y Live Preview.
 
 ## Fase 1 — Backend base (Rust) ✅
 
@@ -285,3 +285,13 @@ Solo `src/`; `src-tauri/` sin cambios (IPC, eventos y comandos intactos).
 - [x] `cargo check --manifest-path src-tauri/Cargo.toml`, `cargo test --lib` (68 pruebas) y `npm run build` sin errores. Las pruebas cubren actualización desde v3, configuración, puerto cerrado, persistencia y limpieza de capturas.
 - [x] WebKit generó un PNG de 960 × 600 con HTML sintético. Verificados con IPC simulado el scrubber, el diff, la confirmación de rollback, la configuración y expansión de la captura.
 - [ ] Prueba integral en la app empaquetada con un servidor de desarrollo real ya iniciado.
+
+## Fase 7.1 — Correcciones del historial visual y Live Preview ✅
+
+- [x] El cursor actualiza la fecha, el agente y la fila seleccionada durante el arrastre. El Inspector solicita los datos pendientes 150 ms después de soltar el cursor o del último cambio por teclado.
+- [x] Los diffs, los avisos y las URLs de imagen se guardan en una caché por checkpoint durante la sesión. Las lecturas en curso se reutilizan y el evento `preview-captured` invalida solo la captura afectada. Una respuesta atrasada no sobrescribe la selección actual ni una captura más reciente.
+- [x] Las claves únicas de React corrigen el montaje duplicado del botón Firewall y de la captura en el Inspector. La app mantiene una suscripción de capturas y el scrubber retira sus listeners al desmontarse.
+- [x] El WebView oculto espera 700 ms tras la navegación, acorta las animaciones CSS, completa las animaciones de duración finita y reactiva el contenido visible mediante `resize`, `scroll`, observadores y frames de JavaScript antes de tomar el PNG.
+- [x] `cargo check --manifest-path src-tauri/Cargo.toml`, `cargo test --lib` (68 pruebas) y `npm run build` sin errores.
+- [x] Verificados con IPC simulado el arrastre sostenido sin solicitudes, el debounce, la caché, las respuestas fuera de orden y la ausencia de duplicados tras cambiar repetidamente de proyecto. WebKit capturó correctamente los cuatro casos de HTML animado de prueba.
+- [ ] Repetir la comprobación con `Krova_Web` en la app empaquetada.

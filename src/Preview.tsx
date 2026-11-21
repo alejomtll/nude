@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { Expand, Image as ImageIcon, X } from "lucide-react";
 import { type FormEvent, useEffect, useRef, useState } from "react";
+import { type CachedPreview } from "./checkpointDetails";
 import { errorMessage, type Checkpoint, type Project } from "./workspace";
 
 interface PreviewInfo {
@@ -9,10 +9,6 @@ interface PreviewInfo {
   checkpointId: string;
   url: string;
   capturedAt: number;
-}
-
-interface PreviewImage extends PreviewInfo {
-  imageBase64: string;
 }
 
 const ports = [5173, 3000, 4321, 8080];
@@ -115,47 +111,17 @@ export function PreviewButton({ project, onUrl }: {
   );
 }
 
-export function CheckpointPreview({ projectId, checkpointId }: { projectId: string; checkpointId: string }) {
-  const [image, setImage] = useState<PreviewImage | null>(null);
+export function CheckpointPreview({ image }: { image: CachedPreview }) {
   const [expanded, setExpanded] = useState(false);
   const dialog = useRef<HTMLDialogElement>(null);
 
   useEffect(() => {
-    let active = true;
-    let sequence = 0;
-    let stop: (() => void) | undefined;
-
-    async function load() {
-      const request = ++sequence;
-      try {
-        const result = await invoke<PreviewImage | null>("get_checkpoint_preview", { projectId, checkpointId });
-        if (active && request === sequence) setImage(result);
-      } catch {
-        // El diff sigue disponible si la captura no se puede leer.
-      }
-    }
-
-    void listen<PreviewInfo>("preview-captured", ({ payload }) => {
-      if (active && payload.projectId === projectId && payload.checkpointId === checkpointId) void load();
-    }).then((unlisten) => {
-      if (!active) return unlisten();
-      stop = unlisten;
-      void load();
-    }, () => { if (active) void load(); });
-
-    return () => { active = false; stop?.(); };
-  }, [projectId, checkpointId]);
-
-  useEffect(() => {
-    if (!expanded || !image) return;
+    if (!expanded) return;
     const element = dialog.current;
     element?.showModal();
     return () => element?.close();
-  }, [expanded, Boolean(image)]);
+  }, [expanded]);
 
-  if (!image) return null;
-
-  const src = `data:image/png;base64,${image.imageBase64}`;
   const date = captureTime.format(image.capturedAt);
   return (
     <div className="checkpoint-preview">
@@ -165,7 +131,7 @@ export function CheckpointPreview({ projectId, checkpointId }: { projectId: stri
       </div>
       <button type="button" className="preview-thumbnail" aria-label="Expandir captura visual"
         onClick={() => setExpanded(true)}>
-        <img src={src} alt="Vista previa capturada en el checkpoint" />
+        <img src={image.src} alt="Vista previa capturada en el checkpoint" />
         <Expand size={14} aria-hidden="true" />
       </button>
       {expanded && (
@@ -179,7 +145,7 @@ export function CheckpointPreview({ projectId, checkpointId }: { projectId: stri
                 <X size={16} aria-hidden="true" />
               </button>
             </div>
-            <img src={src} alt={`Vista previa del ${date}`} />
+            <img src={image.src} alt={`Vista previa del ${date}`} />
           </div>
         </dialog>
       )}

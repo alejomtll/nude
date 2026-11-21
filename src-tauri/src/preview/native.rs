@@ -12,6 +12,7 @@ unsafe extern "C" {
     fn nude_capture_preview(
         url: *const c_char,
         rules: *const c_char,
+        settle_script: *const c_char,
         context: *mut c_void,
         callback: extern "C" fn(*mut c_void, *const u8, usize),
     );
@@ -31,11 +32,21 @@ extern "C" fn receive_png(context: *mut c_void, bytes: *const u8, len: usize) {
 pub async fn capture(app: &AppHandle, url: &str, rules: &str) -> NudeResult<Option<Vec<u8>>> {
     let url = CString::new(url).map_err(|e| NudeError::Task(e.to_string()))?;
     let rules = CString::new(rules).map_err(|e| NudeError::Task(e.to_string()))?;
+    let settle_script =
+        CString::new(include_str!("settle.js")).map_err(|e| NudeError::Task(e.to_string()))?;
     let (send, receive) = oneshot::channel();
     app.run_on_main_thread(move || {
         let context = Box::into_raw(Box::new(send)).cast();
-        // The bridge copies both strings synchronously, and owns the response context.
-        unsafe { nude_capture_preview(url.as_ptr(), rules.as_ptr(), context, receive_png) };
+        // The bridge copies the strings synchronously and owns the response context.
+        unsafe {
+            nude_capture_preview(
+                url.as_ptr(),
+                rules.as_ptr(),
+                settle_script.as_ptr(),
+                context,
+                receive_png,
+            )
+        };
     })
     .map_err(|e| NudeError::Task(e.to_string()))?;
     receive.await.map_err(|e| NudeError::Task(e.to_string()))
