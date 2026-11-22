@@ -1,13 +1,18 @@
 import { RotateCcw } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { agentLabels, type Checkpoint } from "./workspace";
 
 const exactDate = new Intl.DateTimeFormat("es", { dateStyle: "medium", timeStyle: "medium" });
 
-export function TimeScrubber({ checkpoints, selected, onSelect, onRestore, onDraggingChange }: {
-  checkpoints: Checkpoint[];
-  selected: Checkpoint;
-  onSelect: (checkpoint: Checkpoint) => void;
+/**
+ * Barra de historial visual. `timeline` va del más antiguo al más reciente
+ * (`createdAt`, `seq`, `id` ascendentes) y no cambia mientras se arrastra; la
+ * posición se deriva siempre del `id` seleccionado, nunca de un índice guardado.
+ */
+export function TimeScrubber({ timeline, selectedId, onSelect, onRestore, onDraggingChange }: {
+  timeline: Checkpoint[];
+  selectedId: string;
+  onSelect: (checkpointId: string) => void;
   onRestore: (checkpoint: Checkpoint) => void;
   onDraggingChange: (dragging: boolean) => void;
 }) {
@@ -31,18 +36,22 @@ export function TimeScrubber({ checkpoints, selected, onSelect, onRestore, onDra
     };
   }, [onDraggingChange]);
 
-  const last = checkpoints.length - 1;
-  const index = last - checkpoints.findIndex((checkpoint) => checkpoint.id === selected.id);
+  const indexById = useMemo(() => new Map(timeline.map((checkpoint, index) => [checkpoint.id, index])), [timeline]);
+  const last = timeline.length - 1;
+  const index = indexById.get(selectedId) ?? last;
+  const selected = timeline[index];
+  if (!selected) return null;
+
   const date = exactDate.format(Date.parse(selected.createdAt));
   const agent = [agentLabels[selected.agentTool], selected.modelName].filter(Boolean).join(" · ");
   return (
     <section className="time-scrubber" aria-label="Recorrer checkpoints">
       <div className="scrubber-label">
         <label htmlFor="checkpoint-scrubber">Historial visual</label>
-        <span className="mono">{index + 1} / {checkpoints.length}</span>
+        <span className="mono">{index + 1} / {timeline.length}</span>
       </div>
       <input id="checkpoint-scrubber" className="scrubber-range" type="range"
-        min={0} max={last} step={1} value={index} disabled={last === 0}
+        min={0} max={Math.max(last, 0)} step={1} value={index} disabled={last <= 0}
         aria-valuetext={`${date} · ${agent}`}
         onPointerDown={(event) => {
           if (!event.isPrimary || event.button !== 0) return;
@@ -50,8 +59,8 @@ export function TimeScrubber({ checkpoints, selected, onSelect, onRestore, onDra
           onDraggingChange(true);
         }}
         onChange={(event) => {
-          const checkpoint = checkpoints[last - Number(event.currentTarget.value)];
-          if (checkpoint) onSelect(checkpoint);
+          const checkpoint = timeline[Number(event.currentTarget.value)];
+          if (checkpoint && checkpoint.id !== selectedId) onSelect(checkpoint.id);
         }} />
       <div className="scrubber-actions">
         <div className="min-w-0">

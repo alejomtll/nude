@@ -3,8 +3,9 @@
 //! Invariante (AGENTS.md §2): los checkpoints automáticos (`snapshot`,
 //! `restore`, `diff`, `history`) nunca mueven `HEAD`, tocan la rama activa ni
 //! escriben `.git/index`; viven bajo `refs/nude/checkpoints/<session_id>/<ts>`.
-//! Solo `branches` (crear/cambiar rama, commit) modifica el repo del usuario, y
-//! únicamente cuando el usuario lo pide desde la UI.
+//! Solo `branches` (crear/cambiar rama, commit) y `worktrees` (carriles
+//! paralelos: su rama `nude/lane-*` y el merge que pide el usuario) modifican
+//! el repo del usuario, y únicamente cuando el usuario lo pide desde la UI.
 
 // `working_tree_diff` se expondrá como comando más adelante; hasta entonces solo
 // lo usan los tests.
@@ -16,6 +17,7 @@ mod history;
 mod repository;
 mod restore;
 mod snapshot;
+mod worktrees;
 
 pub use repository::{linked_worktrees, register_repository};
 #[cfg_attr(not(test), allow(unused_imports))]
@@ -28,6 +30,9 @@ pub use branches::{CommitResult, checkout_branch, create_branch, quick_commit};
 pub use history::{
     GRAPH_COMMIT_LIMIT, RepoHistory, checkpoint_base_commit, checkpoint_base_commits,
     checkpoint_base_tree_id, read_history,
+};
+pub use worktrees::{
+    LaneDiff, LaneMerge, create_lane_worktree, lane_diff, merge_lane, remove_lane_worktree,
 };
 pub use restore::{restore_working_tree, restore_working_tree_to_base};
 pub use snapshot::{

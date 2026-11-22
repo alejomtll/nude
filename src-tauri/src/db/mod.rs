@@ -4,6 +4,7 @@
 //! - `models`: structs serializables que cruzan el IPC.
 //! - `queries`: operaciones CRUD sobre `Database`.
 
+mod lanes;
 mod migrations;
 pub mod models;
 mod previews;

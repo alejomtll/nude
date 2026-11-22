@@ -52,7 +52,11 @@ pub async fn remove_project(
 ) -> NudeResult<()> {
     let db = db.inner().clone();
     let watcher = watcher.inner().clone();
-    blocking(move || watcher.remove_project(&db, project_id)).await
+    blocking(move || {
+        super::lanes::forget_lanes_of(&db, &watcher, &project_id)?;
+        watcher.remove_project(&db, project_id)
+    })
+    .await
 }
 
 /// Checkpoints del proyecto, del más reciente al más antiguo.

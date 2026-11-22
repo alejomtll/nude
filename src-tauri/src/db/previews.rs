@@ -83,11 +83,14 @@ impl Database {
         Ok(true)
     }
 
+    /// Metadatos y ruta en disco de la captura del checkpoint. No lee la
+    /// imagen: el frontend la carga con `convertFileSrc` (protocolo `asset`),
+    /// así el PNG no viaja por IPC en Base64 al mover el scrubber.
     pub fn read_preview(
         &self,
         project_id: &str,
         checkpoint_id: &str,
-    ) -> NudeResult<Option<(PreviewInfo, Vec<u8>)>> {
+    ) -> NudeResult<Option<(PreviewInfo, PathBuf)>> {
         let Some(path) = self.preview_path(project_id, checkpoint_id) else {
             return Ok(None);
         };
@@ -111,16 +114,19 @@ impl Database {
         let Some(info) = info else {
             return Ok(None);
         };
-        let file = match fs::File::open(path) {
+        drop(conn);
+        let mut file = match fs::File::open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
+        // Solo se ofrece una captura válida: PNG y dentro del tamaño máximo.
         use std::io::Read;
-        let mut bytes = Vec::new();
-        file.take(MAX_PREVIEW_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)?;
-        Ok((bytes.len() <= MAX_PREVIEW_BYTES).then_some((info, bytes)))
+        let mut header = [0u8; 8];
+        let valid = file.metadata()?.len() <= MAX_PREVIEW_BYTES as u64
+            && file.read_exact(&mut header).is_ok()
+            && &header == b"\x89PNG\r\n\x1a\n";
+        Ok(valid.then_some((info, path)))
     }
 
     pub(super) fn cleanup_project_previews(&self, project_id: &str) -> NudeResult<()> {
@@ -281,13 +287,19 @@ mod tests {
             .join(&project.id)
             .join(format!("{}.png", cp.id));
         assert!(path.is_file());
-        let (stored, bytes) = db
+        let (stored, stored_path) = db
             .read_preview(&project.id, &cp.id)
             .expect("read")
             .expect("preview");
         assert_eq!(stored.captured_at, first.captured_at);
         assert_eq!(stored.url, URL);
-        assert_eq!(bytes, PNG);
+        assert_eq!(stored_path, path);
+        assert_eq!(fs::read(&stored_path).expect("png"), PNG);
+
+        // Un archivo corrupto no se ofrece al frontend.
+        fs::write(&path, b"no es png").expect("corrupt");
+        assert!(db.read_preview(&project.id, &cp.id).expect("read").is_none());
+        fs::write(&path, PNG).expect("restore");
 
         db.lock()
             .expect("db")

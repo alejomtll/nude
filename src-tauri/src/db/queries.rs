@@ -10,7 +10,7 @@ use super::models::{
 use crate::error::{NudeError, NudeResult};
 
 const CHECKPOINT_SELECT: &str =
-    "SELECT c.*, s.agent_tool, s.model_name
+    "SELECT c.*, c.rowid AS seq, s.agent_tool, s.model_name
      FROM checkpoints c JOIN agent_sessions s ON s.id = c.session_id";
 
 fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
@@ -46,6 +46,7 @@ fn checkpoint_from_row(row: &Row<'_>) -> rusqlite::Result<Checkpoint> {
         prompt_summary: row.get("prompt_summary")?,
         files_changed_count: row.get("files_changed_count")?,
         created_at: row.get("created_at")?,
+        seq: row.get("seq")?,
     })
 }
 
@@ -73,7 +74,9 @@ impl Database {
     pub fn list_projects(&self) -> NudeResult<Vec<Project>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
+            // Los worktrees de carriles paralelos son internos (ver `db/lanes.rs`).
             "SELECT id, name, root_path, created_at, preview_url FROM projects
+             WHERE root_path NOT IN (SELECT worktree_path FROM agent_lanes)
              ORDER BY name COLLATE NOCASE, created_at",
         )?;
         let rows = stmt.query_map([], project_from_row)?;
@@ -591,5 +594,29 @@ mod tests {
 
         db.delete_project(&project.id).expect("delete project");
         assert!(db.list_guardrails(&project.id).expect("list").is_empty());
+    }
+
+    #[test]
+    fn checkpoints_with_the_same_timestamp_keep_insertion_order_via_seq() {
+        let db = Database::open_in_memory().expect("db");
+        let (project, _) = db.upsert_project("demo", "/tmp/demo-seq").expect("project");
+        let session = db.get_or_create_session(&project.id, AgentTool::Manual, None, None).expect("session");
+        let ids: Vec<String> = (0..3)
+            .map(|i| {
+                db.insert_checkpoint(&session.id, &project.id, &format!("refs/nude/checkpoints/s/{i}"), None, &[])
+                    .expect("checkpoint")
+                    .id
+            })
+            .collect();
+        db.lock()
+            .expect("lock")
+            .execute("UPDATE checkpoints SET created_at = '2026-11-21T10:00:00.000Z'", [])
+            .expect("same timestamp");
+        for _ in 0..3 {
+            let listed = db.list_checkpoints(&project.id).expect("list");
+            let order: Vec<&str> = listed.iter().map(|c| c.id.as_str()).collect();
+            assert_eq!(order, [ids[2].as_str(), ids[1].as_str(), ids[0].as_str()], "más reciente primero, estable");
+            assert!(listed.windows(2).all(|w| w[0].seq > w[1].seq), "seq refleja el orden de inserción");
+        }
     }
 }

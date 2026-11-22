@@ -1,7 +1,7 @@
 # Estado del proyecto Nude
 
 > Checklist vivo. Cada agente lo actualiza al terminar una tarea (ver AGENTS.md §5).
-> Última actualización: 2026-11-21 — Fase 7.1, correcciones del historial visual y Live Preview.
+> Última actualización: 2026-11-21 — Fase 8, sesiones multi-agente en paralelo (Git worktrees).
 
 ## Fase 1 — Backend base (Rust) ✅
 
@@ -295,3 +295,99 @@ Solo `src/`; `src-tauri/` sin cambios (IPC, eventos y comandos intactos).
 - [x] `cargo check --manifest-path src-tauri/Cargo.toml`, `cargo test --lib` (68 pruebas) y `npm run build` sin errores.
 - [x] Verificados con IPC simulado el arrastre sostenido sin solicitudes, el debounce, la caché, las respuestas fuera de orden y la ausencia de duplicados tras cambiar repetidamente de proyecto. WebKit capturó correctamente los cuatro casos de HTML animado de prueba.
 - [ ] Repetir la comprobación con `Krova_Web` en la app empaquetada.
+
+## Fase 7.2 — Scrubber estable al retroceder (auditoría) ✅
+
+### Causas encontradas
+- **La lista se recargaba bajo el puntero.** Cada `checkpoint-created` (en proyectos con servidor de desarrollo, como `Krova_Web`, el watcher crea checkpoints a menudo) recargaba el arreglo desde SQLite en mitad del arrastre, y el scrubber derivaba la posición de ese arreglo cambiante.
+- **Empates de hora.** El scrubber invertía la lista del backend. Los checkpoints con el mismo `created_at` (el par antes/después de un rollback) dependían de un desempate que el frontend no conocía.
+- **La imagen se quedaba pegada.** El Inspector recibía el id a través de `useDeferredValue`, así que durante el arrastre seguía mostrando los datos, y la captura, del checkpoint anterior.
+- **PNG en Base64 por IPC.** `get_checkpoint_preview` leía hasta 4 MiB y lo enviaba codificado en cada paso; el decodificado de la `data:` URL bloqueaba el hilo de la UI.
+- **"Cargando cambios…" infinito.** Una lectura que no respondía nunca dejaba la clave como pendiente y bloqueaba los reintentos.
+
+### Orden estable (backend + `src/workspace.ts`, `src/TimeScrubber.tsx`)
+- [x] `Checkpoint.seq` = `rowid` (orden de inserción), expuesto por `CHECKPOINT_SELECT`
+- [x] El scrubber usa un arreglo propio ordenado con `compareCheckpointsAsc`: `createdAt`, `seq` e `id` ascendentes. Es estrictamente determinista y respeta el orden real de inserción en los empates; un `id` UUID v4 solo como último criterio
+- [x] La posición se deriva siempre del `id` seleccionado (`Map<id, índice>`); `onSelect` recibe un id. Los checkpoints nuevos se añaden al final y no desplazan la selección
+- [x] `useCheckpoints(projectId, revision, hold)`: mientras se arrastra, o hasta que se asienta un paso con teclado, los `checkpoint-created` quedan pendientes y la lista se recarga una sola vez al soltar
+
+### Peticiones y caché (`src/checkpointDetails.ts`, `src/DiffInspector.tsx`)
+- [x] `useCheckpointDetails`: `const reqId = ++requestCounterRef.current` en cada cambio de selección; se ignora cualquier respuesta con `reqId !== requestCounterRef.current`, aunque se guarda en caché
+- [x] Caché `Map<checkpointId, { files, alerts, preview }>` (LRU de 300) con deduplicación de lecturas en curso. Volver a un checkpoint ya visitado es instantáneo y sin IPC, también durante el arrastre
+- [x] Al cambiar de checkpoint la vista se sustituye al momento: si el nuevo no tiene captura (`preview === null`) o aún no se ha consultado, la imagen anterior desaparece. Sin `useDeferredValue`
+- [x] Tiempo máximo de 20 s por carga: nunca queda "Cargando cambios…" para siempre; muestra el error con "Reintentar"
+- [x] `preview-captured` solo vuelve a pedir la captura de ese checkpoint
+
+### Capturas ligeras
+- [x] `get_checkpoint_preview` devuelve `imagePath` (ruta absoluta del PNG), no Base64. `read_preview` comprueba en disco la cabecera PNG y el tamaño máximo sin leer la imagen entera. Se elimina la dependencia `base64`
+- [x] Frontend: `convertFileSrc(imagePath)` + `?v=<capturedAt>` (evita la caché de WebKit al recapturar; el protocolo `asset` ignora la query) e `<img decoding="async">`
+- [x] `tauri` con la feature `protocol-asset` y `app.security.assetProtocol` habilitado **solo** para `$APPDATA/previews/**`
+
+### Verificación
+- [x] `cargo check --manifest-path src-tauri/Cargo.toml` sin errores ni avisos
+- [x] `cargo test --lib` — 69 pruebas (nuevas: orden estable por `seq` con `created_at` idéntico; ruta de captura y rechazo de un PNG corrupto)
+- [x] `npm run build` sin errores
+- [x] IPC simulado con 30 checkpoints (con empates), capturas en 3 de cada 4 y latencias **inversas** (los antiguos responden más tarde):
+  - arrastre del 30 al 4 con un `checkpoint-created` a mitad: 0 recargas y 0 diffs durante el arrastre, 1 recarga al soltar y la selección sigue en el mismo checkpoint (4 / 31)
+  - clic en un checkpoint lento y enseguida en uno rápido: la respuesta tardía no sustituye la vista y queda en caché (volver a él: 0 IPC)
+  - saltos entre 5 checkpoints ya visitados: 0 IPC
+  - un checkpoint sin captura limpia la imagen anterior
+- [ ] Reconstruir `Nude.app` y repetir con `Krova_Web` (el protocolo `asset` no se puede probar fuera de la app empaquetada)
+
+## Fase 8 — Sesiones multi-agente en paralelo (Git worktrees) ✅
+
+### Base de datos (`src-tauri/src/db/`)
+- [x] Migración **v5** (transaccional, como todas): tabla `agent_lanes` (`id`, `project_id` → `projects` `ON DELETE CASCADE`, `name`, `branch_name`, `worktree_path`, `agent_hint`, `status` `active|merged|discarded`, `created_at` INTEGER ms) + índice `(project_id, status)`
+- [x] `db/lanes.rs`: `insert_lane`, `get_lane`, `list_active_lanes`, `set_lane_status`, `lane_project`, `list_watch_targets`, `lane_projects_of`, `copy_guardrails`
+- [x] Cada carril activo tiene una fila **interna** en `projects` (`root_path` = worktree). Así el watcher, los checkpoints, la atribución de sesiones (`cwd` del agente = worktree) y el firewall funcionan en el carril sin mezclarse con la historia del proyecto. `list_projects` las oculta; `list_watch_targets` las incluye al arrancar. El carril hereda las reglas del firewall del proyecto
+
+### Git (`src-tauri/src/git/worktrees.rs`)
+- [x] `create_lane_worktree`: rama `nude/lane-<slug>` desde el `HEAD` del proyecto + worktree en `<datos>/worktrees/<project_id>/<slug>/`. El slug es ASCII, sin acentos y de 40 caracteres como máximo; si ya está ocupado se añade `-2`, `-3`… Si falla, deshace la rama
+- [x] `lane_diff`: archivos del carril (commits + cambios sin confirmar + nuevos no ignorados) contra el ancestro común con la rama del proyecto, con parches, y conflictos que habría al aplicarlo ahora (`merge_trees` en memoria). Solo lectura
+- [x] `merge_lane`: commit de merge `--no-ff` en la rama activa del proyecto (padres: su `HEAD` y el estado del carril; los cambios sin confirmar del carril entran en un commit que no mueve ninguna rama). Antes de escribir comprueba que no haya otra operación de Git en curso, que `HEAD` sea una rama y que el merge en memoria no tenga conflictos. Con `resolve_conflicts` se queda con la versión del carril. El checkout es seguro: si pisaría cambios sin guardar, falla sin tocar nada. La rama solo avanza con `reference_matching` si sigue donde estaba
+- [x] `remove_lane_worktree`: `prune` del worktree, borrado de la carpeta y de la rama. Rechaza rutas fuera de `<datos>/worktrees` y ramas sin el prefijo `nude/lane-`
+- [x] AGENTS.md §2 actualizado: `worktrees.rs` se une a `branches.rs` como único código que toca ramas/`HEAD`, y solo a petición del usuario
+
+### Comandos IPC (`src-tauri/src/commands/lanes.rs`)
+- [x] `create_parallel_lane({ projectId, name, agentHint })`: crea el worktree, lo registra y arranca su watcher al momento. Con nombre vacío usa «Carril N»
+- [x] `list_parallel_lanes({ projectId })`: carriles activos con archivos cambiados respecto a la base, conflictos, última sesión de agente detectada en el worktree, nº de checkpoints y fecha del último checkpoint
+- [x] `get_lane_diff({ laneId })` → `{ baseBranch, baseCommit, files: FileDiff[], conflicts }`
+- [x] `merge_parallel_lane({ laneId, resolveConflicts? })`:
+  - con conflictos sin confirmar devuelve `{ merged: false, conflicts }` sin tocar nada;
+  - si aplica, crea checkpoints `manual` del proyecto antes y después (`guarded_change`), cierra el worktree, borra la rama y marca el carril como `merged`.
+- [x] `discard_parallel_lane({ laneId })`: deja de vigilarlo y borra worktree y rama sin tocar el repo principal → `discarded`
+- [x] Evento `lanes-changed` (payload: `project_id`). Al quitar un proyecto se dejan de vigilar sus carriles; sus worktrees siguen en disco
+
+### UI (`src/ParallelView.tsx`, `src/App.tsx`, `src/workspace.ts`)
+- [x] Tercera pestaña **Paralelo** junto a Timeline y Grafo Git, con contador sutil de carriles activos
+- [x] **Nuevo carril aislado** en 1 clic (botón dividido: con menú para carril de Claude Code / Codex / OpenCode). El carril nuevo se resalta y se desplaza a la vista
+- [x] Columnas lado a lado (1–3 visibles, scroll horizontal si hay más) sobre `#121212` con borde `#262626`. Cada columna muestra:
+  - nombre, rama y agente detectado (modelo y hace cuánto);
+  - botón `cd …` que copia el comando y botones para abrir en Cursor, VS Code, Zed y Finder;
+  - archivos tocados con su diff unificado y avisos de conflicto;
+  - al pie, **Aplicar a main** y **Descartar carril**.
+- [x] Confirmación al aplicar; si hay conflictos, se listan y el botón pasa a «Aplicar con la versión del carril». Confirmación al descartar
+- [x] `useLanes`: se refresca con `lanes-changed`, con `checkpoint-created` de los carriles, al volver el foco a la ventana y cada 15 s mientras haya carriles
+- [x] Paleta ⌘K:
+  - nuevo carril (genérico o por agente);
+  - abrir cada carril en cada editor, copiar su `cd` o aplicarlo;
+  - ir a la vista Paralelo.
+
+### Verificación
+- [x] `cargo check --manifest-path src-tauri/Cargo.toml` sin errores ni avisos
+- [x] `cargo test --lib` — 75 tests (6 nuevos):
+  - **ciclo completo con repo real**: dos carriles editan `app.txt` a la vez sin afectarse; A se aplica a `main` (merge con 2 padres, árbol e índice limpios, worktree y rama de A borrados); B entonces choca y se rechaza sin tocar nada; B se descarta y no queda carpeta, rama `nude/lane-*` ni entrada en `.git/worktrees`.
+  - un cambio sin guardar en `main` bloquea el merge sin mover `HEAD`; confirmar conflictos se queda con la versión del carril.
+  - queries de `agent_lanes`, slugs seguros, negativa a borrar fuera de la carpeta de carriles y descarte de un carril cuya carpeta se borró a mano.
+- [x] `npm run build` OK
+- [x] UI revisada en el navegador con IPC simulado:
+  - columnas, contador y creación en 1 clic;
+  - diálogo de conflictos y comandos de la paleta.
+  - Los archivos del mock se borraron después.
+- [ ] Probar en `Nude.app` con dos agentes reales (Claude Code y Codex) en dos carriles
+
+### Notas
+- Las ramas `nude/lane-*` y el commit de merge son las únicas escrituras en el historial del usuario, y solo ocurren cuando pulsa «Nuevo carril» o «Aplicar». Los checkpoints de cada carril siguen bajo `refs/nude/checkpoints/`, compartidas con el repo principal.
+- Las dependencias (`node_modules`…) no se copian al worktree: el agente debe instalarlas dentro del carril si las necesita.
+- Si el usuario borra la carpeta del carril a mano, la columna muestra el error y «Descartar carril» limpia la rama y el registro.
+

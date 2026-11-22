@@ -57,6 +57,9 @@ pub struct Checkpoint {
     pub prompt_summary: Option<String>,
     pub files_changed_count: i64,
     pub created_at: String,
+    /// Orden de inserción (`rowid`). Desempata checkpoints con el mismo
+    /// `created_at` (p. ej. el par antes/después de un rollback) de forma estable.
+    pub seq: i64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -124,6 +127,56 @@ pub struct Guardrail {
     pub pattern: String,
     pub action: GuardrailAction,
     pub created_at: String,
+}
+
+/// Estado de un carril paralelo (`agent_lanes.status`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LaneStatus {
+    /// Worktree vivo; el agente puede trabajar en él.
+    Active,
+    /// Sus cambios se aplicaron a la rama principal; worktree y rama borrados.
+    Merged,
+    /// Se descartó; worktree y rama borrados sin tocar el repositorio principal.
+    Discarded,
+}
+
+impl LaneStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LaneStatus::Active => "active",
+            LaneStatus::Merged => "merged",
+            LaneStatus::Discarded => "discarded",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "active" => Some(LaneStatus::Active),
+            "merged" => Some(LaneStatus::Merged),
+            "discarded" => Some(LaneStatus::Discarded),
+            _ => None,
+        }
+    }
+}
+
+/// Fila de `agent_lanes`: un worktree aislado donde trabaja un agente.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentLane {
+    pub id: String,
+    /// Proyecto principal (el repositorio del que sale el worktree).
+    pub project_id: String,
+    pub name: String,
+    /// `nude/lane-<slug>`.
+    pub branch_name: String,
+    /// `~/Library/Application Support/com.nude.app/worktrees/<project_id>/<slug>`.
+    pub worktree_path: String,
+    /// Agente previsto (`claude-code`, `codex`, `opencode`…), solo orientativo.
+    pub agent_hint: Option<String>,
+    pub status: LaneStatus,
+    /// Milisegundos desde la época Unix.
+    pub created_at: i64,
 }
 
 pub fn now_rfc3339() -> String {

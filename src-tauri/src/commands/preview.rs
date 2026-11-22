@@ -1,4 +1,3 @@
-use base64::Engine;
 use serde::Serialize;
 use tauri::{AppHandle, State};
 
@@ -41,7 +40,9 @@ pub async fn capture_checkpoint_preview(
 pub struct PreviewImage {
     #[serde(flatten)]
     pub info: PreviewInfo,
-    pub image_base64: String,
+    /// Ruta absoluta del PNG (bajo `<app data>/previews/`). El frontend la
+    /// carga con `convertFileSrc`; nunca viaja la imagen por IPC.
+    pub image_path: String,
 }
 
 #[tauri::command]
@@ -54,9 +55,9 @@ pub async fn get_checkpoint_preview(
     blocking(move || {
         Ok(db
             .read_preview(&project_id, &checkpoint_id)?
-            .map(|(info, png)| PreviewImage {
+            .map(|(info, path)| PreviewImage {
                 info,
-                image_base64: base64::engine::general_purpose::STANDARD.encode(png),
+                image_path: path.to_string_lossy().into_owned(),
             }))
     })
     .await

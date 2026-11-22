@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 export interface Project {
   id: string;
@@ -19,6 +19,15 @@ export interface Checkpoint {
   promptSummary: string | null;
   filesChangedCount: number;
   createdAt: string;
+  /** Orden de inserción en SQLite: desempata checkpoints con el mismo `createdAt`. */
+  seq: number;
+}
+
+/** Orden cronológico estricto y determinista: `createdAt`, `seq` e `id` ascendentes. */
+export function compareCheckpointsAsc(a: Checkpoint, b: Checkpoint) {
+  if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? -1 : 1;
+  if (a.seq !== b.seq) return a.seq - b.seq;
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
 
 export interface FileDiff {
@@ -40,15 +49,33 @@ export function errorMessage(error: unknown) {
 
 export const fileCount = (count: number) => `${count} ${count === 1 ? "archivo" : "archivos"}`;
 
-export function useCheckpoints(projectId: string, revision: number) {
+/**
+ * Checkpoints del proyecto (del más reciente al más antiguo). Con `hold`
+ * activo (el usuario está moviendo el scrubber) la lista no se recarga: los
+ * avisos `checkpoint-created` quedan pendientes y se aplican al soltar, para
+ * que el arreglo que alimenta el scrubber no cambie bajo el puntero.
+ */
+export function useCheckpoints(projectId: string, revision: number, hold = false) {
   const [resource, setResource] = useState<Resource<Checkpoint[]>>({});
   const [live, setLive] = useState<"connecting" | "on" | "off">("connecting");
+  const holdRef = useRef(hold);
+  const staleRef = useRef(false);
+  const refreshRef = useRef<() => void>(() => undefined);
+  holdRef.current = hold;
+
+  useEffect(() => {
+    if (!hold && staleRef.current) {
+      staleRef.current = false;
+      refreshRef.current();
+    }
+  }, [hold]);
 
   useEffect(() => {
     let active = true;
     let request = 0;
     let unlisten: (() => void) | undefined;
     setLive("connecting");
+    refreshRef.current = () => void refresh();
 
     async function refresh() {
       const current = ++request;
@@ -65,7 +92,9 @@ export function useCheckpoints(projectId: string, revision: number) {
     async function subscribe() {
       try {
         const stop = await listen<Checkpoint>("checkpoint-created", ({ payload }) => {
-          if (active && payload.projectId === projectId) void refresh();
+          if (!active || payload.projectId !== projectId) return;
+          if (holdRef.current) staleRef.current = true;
+          else void refresh();
         });
         if (!active) {
           stop();
@@ -494,3 +523,156 @@ export function useWatchStatus(projectId: string) {
   }, [projectId]);
   return { status, setStatus };
 }
+
+// ------------------------------------------------------- carriles paralelos
+
+export type LaneStatus = "active" | "merged" | "discarded";
+
+export interface LaneFile {
+  filePath: string;
+  changeType: FileDiff["changeType"];
+}
+
+export interface LaneActivity {
+  agentTool: AgentTool;
+  modelName: string | null;
+  cwd: string | null;
+  lastActivity: string;
+  /** Escrita en los últimos 15 min: el agente sigue trabajando. */
+  attributable: boolean;
+}
+
+/** Carril activo (`list_parallel_lanes`). */
+export interface Lane {
+  id: string;
+  projectId: string;
+  name: string;
+  branchName: string;
+  worktreePath: string;
+  agentHint: AgentTool | null;
+  status: LaneStatus;
+  /** Milisegundos Unix. */
+  createdAt: number;
+  laneProjectId: string | null;
+  baseBranch: string | null;
+  files: LaneFile[];
+  conflicts: string[];
+  lastActivity: LaneActivity | null;
+  checkpointCount: number;
+  lastCheckpointAt: string | null;
+  error: string | null;
+}
+
+export interface LaneDiff {
+  laneId: string;
+  baseBranch: string | null;
+  baseCommit: string;
+  files: FileDiff[];
+  conflicts: string[];
+}
+
+export interface MergeLaneResult {
+  merged: boolean;
+  conflicts: string[];
+  commitId: string | null;
+  branch: string | null;
+  filesMerged: number;
+  cleanupError: string | null;
+}
+
+export function createLane(projectId: string, agentHint: AgentTool | null = null, name = "") {
+  return invoke<Lane>("create_parallel_lane", { projectId, name, agentHint });
+}
+
+/**
+ * Carriles activos del proyecto. Se refresca cuando cambian (`lanes-changed`),
+ * cuando el watcher captura un checkpoint dentro de un carril y, como red de
+ * seguridad, cada 15 s mientras haya carriles.
+ */
+export function useLanes(projectId: string | undefined, revision: number) {
+  const [resource, setResource] = useState<Resource<Lane[]>>({});
+  const [tick, setTick] = useState(0);
+  const laneProjects = useRef(new Set<string>());
+
+  useEffect(() => {
+    setResource({});
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!projectId) return;
+    let active = true;
+    invoke<Lane[]>("list_parallel_lanes", { projectId }).then(
+      (data) => {
+        if (!active) return;
+        laneProjects.current = new Set(data.flatMap((lane) => lane.laneProjectId ? [lane.laneProjectId] : []));
+        setResource({ data });
+      },
+      (error: unknown) => {
+        if (!active) return;
+        const message = errorMessage(error);
+        setResource((previous) => previous.data ? { data: previous.data, error: message } : { error: message });
+      },
+    );
+    return () => { active = false; };
+  }, [projectId, revision, tick]);
+
+  useEffect(() => {
+    if (!projectId) return;
+    let timer: number | undefined;
+    const soon = () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => setTick((value) => value + 1), 400);
+    };
+    let active = true;
+    const stops: (() => void)[] = [];
+    const subscribe = <T,>(event: string, handler: (payload: T) => void) => {
+      void listen<T>(event, ({ payload }) => handler(payload)).then((stop) => {
+        if (active) stops.push(stop);
+        else stop();
+      }, () => undefined);
+    };
+    subscribe<string>("lanes-changed", (changed) => { if (changed === projectId) soon(); });
+    subscribe<Checkpoint>("checkpoint-created", (checkpoint) => {
+      if (laneProjects.current.has(checkpoint.projectId) || checkpoint.projectId === projectId) soon();
+    });
+    // El agente pudo trabajar mientras la ventana estaba en segundo plano.
+    window.addEventListener("focus", soon);
+    const poll = window.setInterval(() => {
+      if (laneProjects.current.size > 0 && document.visibilityState === "visible") setTick((value) => value + 1);
+    }, 15_000);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+      window.clearInterval(poll);
+      window.removeEventListener("focus", soon);
+      stops.forEach((stop) => stop());
+    };
+  }, [projectId]);
+
+  return { resource, reload: () => setTick((value) => value + 1) };
+}
+
+/** Copia texto al portapapeles (con alternativa si WebKit lo bloquea). */
+export async function copyText(text: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return;
+  } catch {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    const ok = document.execCommand("copy");
+    area.remove();
+    if (!ok) throw new Error("No se pudo copiar al portapapeles.");
+  }
+}
+
+/** `cd` listo para pegar en la terminal (la ruta lleva espacios). */
+export const cdCommand = (path: string) => `cd '${path.replace(/'/g, `'\\''`)}'`;
+
+/** `/Users/nombre/...` → `~/...` */
+export const tildePath = (path: string) => path.replace(/^\/Users\/[^/]+/, "~");

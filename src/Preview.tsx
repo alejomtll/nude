@@ -131,7 +131,7 @@ export function CheckpointPreview({ image }: { image: CachedPreview }) {
       </div>
       <button type="button" className="preview-thumbnail" aria-label="Expandir captura visual"
         onClick={() => setExpanded(true)}>
-        <img src={image.src} alt="Vista previa capturada en el checkpoint" />
+        <img src={image.src} alt="Vista previa capturada en el checkpoint" decoding="async" draggable={false} />
         <Expand size={14} aria-hidden="true" />
       </button>
       {expanded && (
@@ -145,7 +145,7 @@ export function CheckpointPreview({ image }: { image: CachedPreview }) {
                 <X size={16} aria-hidden="true" />
               </button>
             </div>
-            <img src={image.src} alt={`Vista previa del ${date}`} />
+            <img src={image.src} alt={`Vista previa del ${date}`} decoding="async" />
           </div>
         </dialog>
       )}

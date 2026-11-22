@@ -79,6 +79,22 @@ const MIGRATIONS: &[&str] = &[
         url           TEXT NOT NULL
     );
     "#,
+    // v5 — carriles paralelos: un worktree aislado de Git por agente, sobre una
+    // rama temporal `nude/lane-<slug>` basada en el `HEAD` del proyecto.
+    r#"
+    CREATE TABLE IF NOT EXISTS agent_lanes (
+        id             TEXT PRIMARY KEY NOT NULL,
+        project_id     TEXT NOT NULL,
+        name           TEXT NOT NULL,
+        branch_name    TEXT NOT NULL,
+        worktree_path  TEXT NOT NULL,
+        agent_hint     TEXT,
+        status         TEXT NOT NULL CHECK (status IN ('active', 'merged', 'discarded')),
+        created_at     INTEGER NOT NULL,
+        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_lanes_project ON agent_lanes(project_id, status);
+    "#,
 ];
 
 pub fn run(conn: &mut Connection) -> NudeResult<()> {
@@ -167,7 +183,7 @@ mod tests {
                     .expect("database lock")
                     .pragma_query_value(None, "user_version", |row| row.get(0))
                     .expect("migrated schema version");
-                assert_eq!(version, 4);
+                assert_eq!(version, latest_version());
                 let count: i64 = db
                     .lock()
                     .expect("database lock")

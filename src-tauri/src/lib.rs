@@ -83,7 +83,7 @@ pub fn run() {
 
             // Vigilancia de los proyectos ya registrados + checkpoints automáticos.
             let home = app.path().home_dir()?;
-            let projects = database.list_projects()?;
+            let projects = database.list_watch_targets()?;
             let handle = app.handle().clone();
             let watcher_handle = watcher::start(database.clone(), home.clone(), projects, move |event| match event {
                 watcher::WatcherEvent::Checkpoint(checkpoint) => {
@@ -104,6 +104,7 @@ pub fn run() {
 
             app.manage(database);
             app.manage(watcher::HomeDir(home));
+            app.manage(commands::lanes::LaneRoot(data_dir.join("worktrees")));
             app.manage(watcher_handle);
             Ok(())
         })
@@ -133,6 +134,11 @@ pub fn run() {
             commands::preview::set_project_preview_url,
             commands::preview::capture_checkpoint_preview,
             commands::preview::get_checkpoint_preview,
+            commands::lanes::create_parallel_lane,
+            commands::lanes::list_parallel_lanes,
+            commands::lanes::get_lane_diff,
+            commands::lanes::merge_parallel_lane,
+            commands::lanes::discard_parallel_lane,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -55,7 +55,7 @@ fn rfc3339(time: SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-fn sighting(home: &Path, root: &Path, now: SystemTime) -> Option<AgentSighting> {
+pub(super) fn sighting(home: &Path, root: &Path, now: SystemTime) -> Option<AgentSighting> {
     let (at, session) = watcher::latest_session(home, root, now, DIAGNOSTIC_WINDOW)?;
     Some(AgentSighting {
         agent_tool: session.tool.as_str().to_owned(),
@@ -80,7 +80,7 @@ pub async fn get_watcher_diagnostics(
         let project = project_or_404(&db, &project_id)?;
         let root = Path::new(&project.root_path);
         let now = SystemTime::now();
-        let projects = db.list_projects()?;
+        let projects = db.list_watch_targets()?;
         let worktrees = git::linked_worktrees(root)
             .unwrap_or_default()
             .into_iter()

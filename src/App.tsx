@@ -2,24 +2,26 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
-  BookmarkPlus, ClipboardPaste, Code, Command, Ellipsis, FileCode, FolderOpen, GitBranch, House, ListTree,
-  PanelLeft, PanelLeftClose, PanelLeftOpen, Plus, RotateCcw, Shield, Trash2, Undo2,
+  BookmarkPlus, ClipboardPaste, Code, Columns3, Command, Copy, Ellipsis, FileCode, FolderOpen, GitBranch, GitMerge,
+  House, ListTree, PanelLeft, PanelLeftClose, PanelLeftOpen, Plus, RotateCcw, Shield, Trash2, Undo2,
 } from "lucide-react";
-import { memo, type FormEvent, useCallback, useDeferredValue, useEffect, useRef, useState } from "react";
+import { memo, type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useCheckpointDetailsCache, type CheckpointDetails } from "./checkpointDetails";
 import { CommandPalette, type PaletteCommand } from "./CommandPalette";
 import { DiffInspector, type Editors } from "./DiffInspector";
 import { type GraphAction, GitGraphView } from "./GitGraphView";
 import { GuardrailToasts, GuardrailsButton } from "./Guardrails";
+import { ParallelView } from "./ParallelView";
 import { PreviewButton } from "./Preview";
 import { TimeScrubber } from "./TimeScrubber";
 import { ProjectLauncher } from "./ProjectLauncher";
 import { LiveIndicator } from "./WatcherStatus";
 import { Wordmark } from "./Wordmark";
 import {
-  agentLabels, cleanPrompt, errorMessage, fileCount, openInEditor, suggestedBranchName, useCheckpoints,
-  useEditors, useGuardrailAlerts, useUndoPlan,
-  type Checkpoint, type OpenTarget, type Project, type Resource, type UndoAgentPlan,
+  agentLabels, cdCommand, cleanPrompt, compareCheckpointsAsc, copyText, createLane, errorMessage, fileCount, openInEditor,
+  suggestedBranchName, tildePath, useCheckpoints, useEditors, useGuardrailAlerts, useLanes, useUndoPlan,
+  type AgentTool, type Checkpoint, type Lane, type MergeLaneResult, type OpenTarget, type Project, type Resource,
+  type UndoAgentPlan,
 } from "./workspace";
 import "./App.css";
 
@@ -35,7 +37,7 @@ function timeAgo(date: string, now: number) {
   return relativeDate.format(-Math.floor(minutes / 1440), "day");
 }
 
-type View = "timeline" | "graph";
+type View = "timeline" | "graph" | "parallel";
 
 type Action =
   | { kind: "add" }
@@ -44,7 +46,9 @@ type Action =
   | { kind: "rollback"; project: Project; checkpoint: Checkpoint }
   | { kind: "undo"; project: Project; plan: UndoAgentPlan }
   | { kind: "branch"; project: Project; fromCommit: string | null; label: string }
-  | { kind: "checkout"; project: Project; branch: string };
+  | { kind: "checkout"; project: Project; branch: string }
+  | { kind: "mergeLane"; project: Project; lane: Lane }
+  | { kind: "discardLane"; project: Project; lane: Lane };
 
 const actions: Record<Action["kind"], { title: string; submit: string }> = {
   add: { title: "Agregar proyecto", submit: "Agregar proyecto" },
@@ -54,6 +58,8 @@ const actions: Record<Action["kind"], { title: string; submit: string }> = {
   undo: { title: "¿Deshacer el último agente?", submit: "Deshacer sesión" },
   branch: { title: "Nueva rama de prueba", submit: "Crear rama" },
   checkout: { title: "¿Cambiar de rama?", submit: "Cambiar de rama" },
+  mergeLane: { title: "¿Aplicar el carril?", submit: "Aplicar carril" },
+  discardLane: { title: "¿Descartar el carril?", submit: "Descartar carril" },
 };
 
 async function pickFolder(): Promise<string | null> {
@@ -120,7 +126,10 @@ function ActionDialog({ action, close, submit }: {
     }
   }
 
-  const destructive = action.kind === "remove" || action.kind === "rollback" || action.kind === "undo";
+  const destructive = action.kind === "remove" || action.kind === "rollback" || action.kind === "undo"
+    || action.kind === "discardLane";
+  const laneConflicts = action.kind === "mergeLane" ? action.lane.conflicts : [];
+  const submitLabel = laneConflicts.length ? "Aplicar con la versión del carril" : actions[action.kind].submit;
   return (
     <dialog
       ref={dialog}
@@ -184,6 +193,20 @@ function ActionDialog({ action, close, submit }: {
         {action.kind === "checkout" && (
           <p>Se cambiará a <strong>{action.branch}</strong>. Los cambios sin commit que no choquen se mantienen; si alguno chocara, no se toca nada. Nude guarda antes un checkpoint.</p>
         )}
+        {action.kind === "mergeLane" && (
+          <>
+            <p>Se aplicarán los cambios de <strong>{action.lane.name}</strong> ({fileCount(action.lane.files.length)}) sobre <strong>{action.lane.baseBranch ?? "la rama actual"}</strong> con un commit de merge (<span className="mono">--no-ff</span>). Nude guarda antes un checkpoint y, si el merge pisara cambios sin guardar, no toca nada. Después se borran el worktree y la rama <span className="mono">{action.lane.branchName}</span>.</p>
+            {laneConflicts.length > 0 && (
+              <div className="lane-conflict-list" role="alert">
+                <p>Estos archivos también cambiaron en {action.lane.baseBranch ?? "la rama actual"}. Si continúas, se usará la versión del carril:</p>
+                <ul>{laneConflicts.map((path) => <li key={path} className="mono">{path}</li>)}</ul>
+              </div>
+            )}
+          </>
+        )}
+        {action.kind === "discardLane" && (
+          <p>Se borrarán el worktree <span className="mono">{tildePath(action.lane.worktreePath)}</span> y la rama <span className="mono">{action.lane.branchName}</span>{action.lane.files.length ? <> con sus {fileCount(action.lane.files.length)} cambiados</> : null}. El repositorio principal no se toca. No se puede deshacer.</p>
+        )}
         {error && <p className="error-text mt-3" role="alert">{error}</p>}
         <div className="mt-5 flex justify-end gap-2">
           <button type="button" className="button" autoFocus={destructive} onClick={close} disabled={pending}>
@@ -192,7 +215,7 @@ function ActionDialog({ action, close, submit }: {
           {!blocked && (
             <button type="submit" className={`button ${destructive ? "button-danger" : "button-primary"}`}
               disabled={pending || (needsValue && !value.trim())}>
-              {pending ? "Procesando…" : actions[action.kind].submit}
+              {pending ? "Procesando…" : submitLabel}
             </button>
           )}
         </div>
@@ -252,12 +275,15 @@ function TimelineView({
   onNotice: (text: string) => void;
   onWatchPath: (path: string) => Promise<void>;
 }) {
-  const { resource, live } = useCheckpoints(project.id, revision);
   const [selection, setSelection] = useState<string | undefined>(focus);
   const [scrubbed, setScrubbed] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [settled, setSettled] = useState<string>();
   const [now, setNow] = useState(Date.now);
+  // Mientras se mueve el scrubber (arrastre o pasos con teclado aún sin
+  // asentar) la lista no se recarga desde SQLite.
+  const scrubbing = dragging || (scrubbed && settled !== selection);
+  const { resource, live } = useCheckpoints(project.id, revision, scrubbing);
 
   const selectRow = useCallback((id: string) => {
     setScrubbed(false);
@@ -272,16 +298,22 @@ function TimelineView({
     if (focus) document.getElementById(`checkpoint-${focus}`)?.scrollIntoView({ block: "nearest" });
   }, [focus, resource.data]);
 
-  const checkpoints = resource.data ?? [];
+  const checkpoints = useMemo(() => resource.data ?? [], [resource.data]);
+  // Scrubber: orden cronológico estricto (antiguo → reciente), independiente
+  // del orden de la lista.
+  const timeline = useMemo(() => [...checkpoints].sort(compareCheckpointsAsc), [checkpoints]);
   const selected = checkpoints.find((item) => item.id === selection) ?? checkpoints[0];
   const selectedId = selected?.id;
-  const inspectorId = useDeferredValue(selectedId);
   useEffect(() => {
-    if (!selectedId || !scrubbed || dragging) return;
+    if (!selectedId || dragging) return;
+    if (!scrubbed) {
+      setSettled(selectedId);
+      return;
+    }
     const timer = window.setTimeout(() => {
       setSettled(selectedId);
       document.getElementById(`checkpoint-${selectedId}`)?.scrollIntoView({ block: "nearest" });
-    }, 150);
+    }, 120);
     return () => window.clearTimeout(timer);
   }, [selectedId, scrubbed, dragging]);
 
@@ -301,13 +333,12 @@ function TimelineView({
           </div>
         </header>
 
-        {selected && (
-          <TimeScrubber checkpoints={checkpoints} selected={selected} onRestore={onRollback}
+        {selectedId && (
+          <TimeScrubber timeline={timeline} selectedId={selectedId} onRestore={onRollback}
             onDraggingChange={setDragging}
-            onSelect={(checkpoint) => {
+            onSelect={(checkpointId) => {
               setScrubbed(true);
-              setSettled(undefined);
-              setSelection(checkpoint.id);
+              setSelection(checkpointId);
             }} />
         )}
 
@@ -335,15 +366,16 @@ function TimelineView({
           ) : !resource.error && <div className="empty-state" role="status">Cargando checkpoints…</div>}
         </div>
       </main>
-      <DiffInspector projectId={project.id} checkpointId={inspectorId} cache={cache}
-        ready={inspectorId === selectedId && !dragging && (!scrubbed || settled === selectedId)}
+      <DiffInspector projectId={project.id} checkpointId={selectedId} cache={cache}
+        ready={!dragging && settled === selectedId}
         projectRoot={project.rootPath} editors={editors} onTarget={onTarget} />
     </>
   );
 }
 
-function TopBar({ view, setView, project, revision, onUndo, guardOpen, setGuardOpen, onPalette, onPreviewUrl }: {
+function TopBar({ view, setView, project, revision, laneCount, onUndo, guardOpen, setGuardOpen, onPalette, onPreviewUrl }: {
   project: Project;
+  laneCount: number;
   view: View;
   setView: (view: View) => void;
   revision: number;
@@ -361,6 +393,11 @@ function TopBar({ view, setView, project, revision, onUndo, guardOpen, setGuardO
         </button>
         <button role="tab" aria-selected={view === "graph"} onClick={() => setView("graph")}>
           Grafo Git
+        </button>
+        <button role="tab" aria-selected={view === "parallel"} onClick={() => setView("parallel")}
+          title="Carriles paralelos: un worktree aislado por agente">
+          Paralelo
+          {laneCount > 0 && <span className="tab-count" aria-label={`${laneCount} carriles activos`}>{laneCount}</span>}
         </button>
       </div>
       <div className="topbar-actions">
@@ -473,6 +510,9 @@ function App() {
   const checkpointCache = useCheckpointDetailsCache();
   const items = projects.data ?? [];
   const project = items.find((item) => item.id === selectedProjectId);
+  const lanes = useLanes(project?.id, revision);
+  const activeLanes = lanes.resource.data ?? [];
+  const [freshLane, setFreshLane] = useState<string | null>(null);
   const confirmRollback = useCallback((checkpoint: Checkpoint) => {
     if (project) setAction({ kind: "rollback", project, checkpoint });
   }, [project]);
@@ -565,6 +605,28 @@ function App() {
     }
   }
 
+  async function newLane(current: Project, agentHint: AgentTool | null) {
+    setNotice("");
+    try {
+      const lane = await createLane(current.id, agentHint);
+      setFreshLane(lane.id);
+      setView("parallel");
+      lanes.reload();
+      setNotice(`«${lane.name}» listo en ${lane.branchName}`);
+    } catch (reason) {
+      setNotice(errorMessage(reason));
+    }
+  }
+
+  async function copyLanePath(lane: Lane) {
+    try {
+      await copyText(cdCommand(lane.worktreePath));
+      setNotice("Comando cd copiado");
+    } catch (reason) {
+      setNotice(errorMessage(reason));
+    }
+  }
+
   function paletteCommands(): PaletteCommand[] {
     const commands: PaletteCommand[] = [];
     const installed = editors.editors;
@@ -577,7 +639,37 @@ function App() {
           keywords: "revertir sesión rollback", run: () => startUndo(project) },
         { id: "guardrails", group: "Acciones", title: "Firewall de archivos…", icon: <Shield size={14} />,
           keywords: "guardrails proteger bloquear env", run: () => setGuardOpen(true) },
+        { id: "lane-new", group: "Acciones", title: "Nuevo carril aislado", icon: <Columns3 size={14} />,
+          keywords: "paralelo worktree agente rama", run: () => newLane(project, null) },
       );
+      for (const agent of ["claude-code", "codex", "opencode"] as const) {
+        commands.push({
+          id: `lane-new-${agent}`, group: "Acciones", title: `Nuevo carril para ${agentLabels[agent]}`,
+          icon: <Columns3 size={14} />, keywords: "paralelo worktree agente rama", run: () => newLane(project, agent),
+        });
+      }
+      for (const lane of activeLanes) {
+        commands.push({
+          id: `lane-cd-${lane.id}`, group: "Acciones", title: `Copiar cd de «${lane.name}»`,
+          hint: lane.branchName, icon: <Copy size={14} />, keywords: "carril paralelo ruta terminal worktree",
+          run: () => copyLanePath(lane),
+        });
+        for (const editor of installed) {
+          commands.push({
+            id: `lane-${lane.id}-${editor.id}`, group: "Acciones",
+            title: editor.id === "finder" ? `Mostrar «${lane.name}» en Finder` : `Abrir «${lane.name}» en ${editor.name}`,
+            hint: lane.branchName, icon: editor.id === "finder" ? <FolderOpen size={14} /> : <Code size={14} />,
+            keywords: "carril paralelo worktree editor", run: () => openWith(editor.id, lane.worktreePath),
+          });
+        }
+        if (lane.files.length && !lane.error) {
+          commands.push({
+            id: `lane-merge-${lane.id}`, group: "Acciones", title: `Aplicar «${lane.name}» a ${lane.baseBranch ?? "main"}`,
+            hint: fileCount(lane.files.length), icon: <GitMerge size={14} />, keywords: "carril paralelo merge fusionar",
+            run: () => setAction({ kind: "mergeLane", project, lane }),
+          });
+        }
+      }
       if (target) {
         const name = target.path.split("/").pop() ?? target.path;
         for (const editor of installed) {
@@ -608,6 +700,9 @@ function App() {
           hint: view === "timeline" ? "actual" : undefined, keywords: "vista checkpoints historial", run: () => setView("timeline") },
         { id: "view-graph", group: "Navegación", title: "Grafo Git", icon: <GitBranch size={14} />,
           hint: view === "graph" ? "actual" : undefined, keywords: "vista ramas commits", run: () => setView("graph") },
+        { id: "view-parallel", group: "Navegación", title: "Paralelo", icon: <Columns3 size={14} />,
+          hint: view === "parallel" ? "actual" : activeLanes.length ? `${activeLanes.length} carriles` : undefined,
+          keywords: "vista carriles worktrees agentes", run: () => setView("parallel") },
         { id: "sidebar", group: "Navegación", title: collapsed ? "Mostrar barra lateral" : "Ocultar barra lateral",
           shortcut: "⌘B", icon: <PanelLeft size={14} />, run: () => setCollapsed((value) => !value) },
         { id: "home", group: "Navegación", title: "Volver al inicio", icon: <House size={14} />, run: () => selectProject(null) },
@@ -689,6 +784,23 @@ function App() {
         await invoke("git_checkout_branch", { projectId: action.project.id, name: action.branch });
         announce(`Ahora estás en ${action.branch}`);
         break;
+      case "mergeLane": {
+        const result = await invoke<MergeLaneResult>("merge_parallel_lane", {
+          laneId: action.lane.id, resolveConflicts: action.lane.conflicts.length > 0,
+        });
+        if (!result.merged) {
+          lanes.reload();
+          throw new Error(`Aparecieron conflictos nuevos en ${result.conflicts.join(", ")}. Cierra y vuelve a pulsar «Aplicar» para revisarlos.`);
+        }
+        announce(result.cleanupError
+          ? `Carril aplicado a ${result.branch}, pero no se pudo borrar: ${result.cleanupError}`
+          : `«${action.lane.name}» aplicado a ${result.branch} · ${fileCount(result.filesMerged)}`);
+        break;
+      }
+      case "discardLane":
+        await invoke("discard_parallel_lane", { laneId: action.lane.id });
+        announce(`«${action.lane.name}» descartado`);
+        break;
     }
   }
 
@@ -741,12 +853,19 @@ function App() {
             )}
           </aside>
           <TopBar key={`topbar:${project.id}`} project={project} view={view} setView={setView} revision={revision}
+            laneCount={activeLanes.length}
             onUndo={(plan) => setAction({ kind: "undo", project, plan })}
             guardOpen={guardOpen} setGuardOpen={setGuardOpen} onPalette={() => setPalette(true)}
             onPreviewUrl={(previewUrl) => setProjects((previous) => ({
               ...previous, data: previous.data?.map((item) => item.id === project.id ? { ...item, previewUrl } : item),
             }))} />
-          {view === "graph" ? (
+          {view === "parallel" ? (
+            <ParallelView key={project.id} project={project} lanes={lanes.resource} onReload={lanes.reload}
+              editors={editors} freshLaneId={freshLane} onNotice={setNotice}
+              onCreate={(hint) => newLane(project, hint)}
+              onMerge={(lane) => setAction({ kind: "mergeLane", project, lane })}
+              onDiscard={(lane) => setAction({ kind: "discardLane", project, lane })} />
+          ) : view === "graph" ? (
             <GitGraphView key={project.id} project={project} revision={revision} onAction={onGraphAction}
               onNotice={setNotice}
               onOpenCheckpoint={(id) => { setFocus(id); setView("timeline"); }} />

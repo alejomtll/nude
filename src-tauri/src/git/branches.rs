@@ -23,7 +23,7 @@ pub struct CommitResult {
     pub files_committed: usize,
 }
 
-fn ensure_clean_state(repo: &Repository) -> NudeResult<()> {
+pub(super) fn ensure_clean_state(repo: &Repository) -> NudeResult<()> {
     if repo.state() != RepositoryState::Clean {
         return Err(NudeError::GitOperation(format!(
             "el repositorio está en mitad de una operación ({:?}); termínala o abórtala en la terminal",
