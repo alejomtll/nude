@@ -1,5 +1,6 @@
-//! Abrir proyectos y archivos en el editor instalado (Cursor, VS Code, Zed) o
-//! en Finder. Solo lanza procesos locales de macOS; nada de red.
+//! Abrir proyectos y archivos en el editor instalado (Cursor, VS Code, Zed),
+//! en Finder o en las apps nativas de agentes (Claude, Codex) con `open -a`.
+//! Solo lanza procesos locales de macOS; nada de red.
 //!
 //! Para saltar a una línea se usa la CLI que trae cada app dentro de su
 //! bundle (no hace falta que el usuario la haya instalado en el `PATH`). Si no
@@ -20,6 +21,18 @@ pub enum Editor {
     Vscode,
     Zed,
     Finder,
+    /// `Claude.app` (escritorio de Anthropic).
+    Claude,
+    /// `Codex.app` (escritorio de OpenAI).
+    Codex,
+}
+
+/// Editor de código o app nativa de un agente (esta solo abre carpetas).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EditorKind {
+    Editor,
+    Agent,
 }
 
 struct EditorApp {
@@ -27,8 +40,9 @@ struct EditorApp {
     name: &'static str,
     bundle_ids: &'static [&'static str],
     app_names: &'static [&'static str],
-    /// CLI dentro del bundle, relativa a `<App>.app/`.
-    cli: &'static str,
+    /// CLI dentro del bundle, relativa a `<App>.app/` (`None` = `open -a`).
+    cli: Option<&'static str>,
+    kind: EditorKind,
 }
 
 const APPS: &[EditorApp] = &[
@@ -37,21 +51,40 @@ const APPS: &[EditorApp] = &[
         name: "Cursor",
         bundle_ids: &["com.todesktop.230313mzl4w4u92"],
         app_names: &["Cursor.app"],
-        cli: "Contents/Resources/app/bin/cursor",
+        cli: Some("Contents/Resources/app/bin/cursor"),
+        kind: EditorKind::Editor,
     },
     EditorApp {
         editor: Editor::Vscode,
         name: "VS Code",
         bundle_ids: &["com.microsoft.VSCode", "com.microsoft.VSCodeInsiders"],
         app_names: &["Visual Studio Code.app", "Visual Studio Code - Insiders.app"],
-        cli: "Contents/Resources/app/bin/code",
+        cli: Some("Contents/Resources/app/bin/code"),
+        kind: EditorKind::Editor,
     },
     EditorApp {
         editor: Editor::Zed,
         name: "Zed",
         bundle_ids: &["dev.zed.Zed", "dev.zed.Zed-Preview"],
         app_names: &["Zed.app", "Zed Preview.app"],
-        cli: "Contents/MacOS/cli",
+        cli: Some("Contents/MacOS/cli"),
+        kind: EditorKind::Editor,
+    },
+    EditorApp {
+        editor: Editor::Claude,
+        name: "Claude",
+        bundle_ids: &["com.anthropic.claudefordesktop"],
+        app_names: &["Claude.app"],
+        cli: None,
+        kind: EditorKind::Agent,
+    },
+    EditorApp {
+        editor: Editor::Codex,
+        name: "Codex",
+        bundle_ids: &["com.openai.codex"],
+        app_names: &["Codex.app"],
+        cli: None,
+        kind: EditorKind::Agent,
     },
 ];
 
@@ -61,6 +94,7 @@ pub struct EditorInfo {
     pub id: Editor,
     pub name: &'static str,
     pub installed: bool,
+    pub kind: EditorKind,
 }
 
 fn app_spec(editor: Editor) -> Option<&'static EditorApp> {
@@ -113,12 +147,12 @@ fn launch_plan(
 
     let app = app_spec(editor).ok_or_else(|| NudeError::NotFound("editor".into()))?;
     let app_path = app_path.ok_or_else(|| NudeError::NotFound(format!("{} no está instalado", app.name)))?;
-    let cli = app_path.join(app.cli);
+    let cli = app.cli.map(|cli| app_path.join(cli));
     let located = match line.filter(|_| !is_dir) {
         Some(line) => format!("{target_str}:{}", line.max(1)),
         None => target_str.clone(),
     };
-    if cli.is_file() {
+    if let Some(cli) = cli.filter(|cli| cli.is_file()) {
         let args = match editor {
             Editor::Zed => vec![located],
             // `-g` = ir a la línea; sin línea, abrir la carpeta/archivo tal cual.
@@ -139,9 +173,9 @@ pub async fn list_editors() -> NudeResult<Vec<EditorInfo>> {
     blocking(|| {
         let mut editors: Vec<EditorInfo> = APPS
             .iter()
-            .map(|app| EditorInfo { id: app.editor, name: app.name, installed: locate_app(app).is_some() })
+            .map(|app| EditorInfo { id: app.editor, name: app.name, installed: locate_app(app).is_some(), kind: app.kind })
             .collect();
-        editors.push(EditorInfo { id: Editor::Finder, name: "Finder", installed: true });
+        editors.push(EditorInfo { id: Editor::Finder, name: "Finder", installed: true, kind: EditorKind::Editor });
         Ok(editors)
     })
     .await
@@ -222,6 +256,14 @@ mod tests {
         assert_eq!(args[2], "/repo/src/main.rs");
 
         assert!(launch_plan(Editor::Cursor, None, file, None, false).is_err(), "no instalado");
+
+        // Apps nativas de agentes: siempre `open -a <App> <carpeta>`, sin línea.
+        let claude = tmp_app(None);
+        let (program, args) = launch_plan(Editor::Claude, Some(&claude), Path::new("/lane"), Some(3), true).expect("plan");
+        assert_eq!(program, PathBuf::from("/usr/bin/open"));
+        assert_eq!(args, ["-a".to_owned(), claude.to_string_lossy().into_owned(), "/lane".to_owned()]);
+        assert!(launch_plan(Editor::Codex, None, Path::new("/lane"), None, true).is_err(), "Codex.app no instalada");
+        let _ = std::fs::remove_dir_all(claude.parent().expect("parent"));
         for app in [code, zed, cursor] {
             let _ = std::fs::remove_dir_all(app.parent().expect("parent"));
         }

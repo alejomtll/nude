@@ -26,6 +26,7 @@ Ubicación: `~/Library/Application Support/com.nude.app/nude.db`
   - `src-tauri/src/watcher/` (observador de archivos + detector de sesiones de agentes)
   - `src-tauri/src/commands/` (comandos IPC expuestos al frontend)
   - `src-tauri/src/safety.rs` (alertas de archivos sensibles y bucles de agentes)
+  - `src-tauri/src/pty/` (terminales PTY de los carriles paralelos: `portable-pty`, shell de login del usuario)
 - **Frontend:** Componentes funcionales en TypeScript estricto (`strict: true`), Tailwind CSS, interfaz oscura minimalista estilo macOS nativo.
 
 ## 5. Flujo de Trabajo entre Agentes

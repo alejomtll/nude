@@ -654,7 +654,7 @@ function App() {
           hint: lane.branchName, icon: <Copy size={14} />, keywords: "carril paralelo ruta terminal worktree",
           run: () => copyLanePath(lane),
         });
-        for (const editor of installed) {
+        for (const editor of [...installed, ...editors.agentApps]) {
           commands.push({
             id: `lane-${lane.id}-${editor.id}`, group: "Acciones",
             title: editor.id === "finder" ? `Mostrar «${lane.name}» en Finder` : `Abrir «${lane.name}» en ${editor.name}`,

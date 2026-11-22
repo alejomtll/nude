@@ -11,6 +11,7 @@ pub mod guardrails;
 pub mod lanes;
 pub mod preview;
 pub mod projects;
+pub mod pty;
 pub mod watcher;
 
 use crate::db::Database;

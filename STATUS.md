@@ -1,7 +1,7 @@
 # Estado del proyecto Nude
 
 > Checklist vivo. Cada agente lo actualiza al terminar una tarea (ver AGENTS.md §5).
-> Última actualización: 2026-11-21 — Fase 8, sesiones multi-agente en paralelo (Git worktrees).
+> Última actualización: 2026-11-22 — Fase 8.1, terminal embebida por carril y apps nativas de agentes.
 
 ## Fase 1 — Backend base (Rust) ✅
 
@@ -390,4 +390,58 @@ Solo `src/`; `src-tauri/` sin cambios (IPC, eventos y comandos intactos).
 - Las ramas `nude/lane-*` y el commit de merge son las únicas escrituras en el historial del usuario, y solo ocurren cuando pulsa «Nuevo carril» o «Aplicar». Los checkpoints de cada carril siguen bajo `refs/nude/checkpoints/`, compartidas con el repo principal.
 - Las dependencias (`node_modules`…) no se copian al worktree: el agente debe instalarlas dentro del carril si las necesita.
 - Si el usuario borra la carpeta del carril a mano, la columna muestra el error y «Descartar carril» limpia la rama y el registro.
+
+## Fase 8.1 — Terminal embebida por carril y apps nativas ✅
+
+### Gestor PTY (`src-tauri/src/pty/mod.rs`, crate `portable-pty` 0.9)
+- [x] `PtyManager` (estado de Tauri) con una sesión por carril:
+  - el shell de login del usuario (`$SHELL -l -i`, o `/bin/zsh` si falta) se abre en el worktree, así hereda el `PATH` de Homebrew, nvm y cargo;
+  - con `TERM=xterm-256color`, `COLORTERM=truecolor` y `LANG` por defecto si la app se abrió desde Finder.
+- [x] El agente (`claude`, `codex` u `opencode`) se lanza con `-c`. Si su binario no está en el `PATH`, la propia terminal explica cómo instalarlo (npm o brew) o abrir la app nativa. En ambos casos el usuario acaba en su shell (`exec $SHELL -l -i`). Hay variante para fish
+- [x] Salida emitida como `lane-pty-output` (`{ laneId, sessionId, data, end }`):
+  - la decodificación UTF-8 no parte caracteres entre lecturas;
+  - el historial guarda hasta 512 KiB, recortado por líneas;
+  - el fin del proceso se emite como `lane-pty-exit` (`{ laneId, sessionId, exitCode }`).
+- [x] Reenganche sin pérdidas ni duplicados: la UI recibe el historial hasta `end` e ignora los eventos ya incluidos; el `sessionId` descarta eventos de sesiones anteriores
+- [x] Cierre: `SIGHUP` al shell (lo reenvía al agente) y cierre del PTY. Si sigue vivo a los 1,5 s, `SIGKILL`. Al salir de la app (`RunEvent::Exit`) se cierran todas las sesiones
+
+### Comandos IPC (`src-tauri/src/commands/pty.rs`, como manda AGENTS.md §4)
+- [x] `spawn_lane_pty({ laneId, agentCmd, cols, rows })`: `agentCmd` = `claude-code` (alias `claude`), `codex`, `opencode` o `shell`. Reutiliza la sesión si sigue viva y devuelve estado + historial
+- [x] `write_lane_pty({ laneId, data })`, `resize_lane_pty({ laneId, cols, rows })`, `kill_lane_pty({ laneId })`
+- [x] `attach_lane_pty({ laneId })` (extra): engancharse a la sesión existente, viva o terminada, sin lanzar nada
+- [x] `create_parallel_lane` con preset (`agentHint`) arranca el agente al momento. Aplicar o descartar un carril, o quitar su proyecto, cierra antes su proceso
+- [x] `list_parallel_lanes` incluye `terminal` (`{ sessionId, program, running, exitCode, pid }`)
+
+### Apps nativas (`src-tauri/src/commands/editor.rs`)
+- [x] `Claude.app` (`com.anthropic.claudefordesktop`) y `Codex.app` (`com.openai.codex`) se detectan como `kind: "agent"` y se abren con `open -a <App> <carpeta>`
+- [x] `useEditors` las separa (`agentApps`): aparecen en la cabecera de cada carril y en ⌘K («Abrir «carril» en Claude/Codex»), pero no para abrir archivos ni como editor preferido
+
+### UI (`src/LaneTerminal.tsx`, `src/ParallelView.tsx`)
+- [x] `@xterm/xterm` 6 + `@xterm/addon-fit`. Tema: fondo `#121212`, texto `#E5E5E5`, cursor `#A3A3A3`, mono JetBrains/SF Mono y ANSI apagados. Se carga en diferido (chunk propio), así que no pesa al abrir la app
+- [x] Cada carril tiene pestañas **Terminal** (por defecto si el carril tiene preset o sesión; punto verde si está en marcha) y **Cambios (N)** (archivos y diff). La terminal sigue montada aunque se mire el diff
+- [x] Sin proceso: botones «Iniciar Claude Code / Codex / OpenCode» (el preset primero) y «Solo shell»
+- [x] Barra de estado: «en marcha» con **Detener**, o «terminado (código N)» con **Reiniciar** y **Shell**
+- [x] Ajuste de tamaño con `ResizeObserver` → `resize_lane_pty` (80 ms de calma; también al engancharse a una sesión creada con otro tamaño)
+
+### Verificación
+- [x] `cargo check --manifest-path src-tauri/Cargo.toml` sin errores ni avisos
+- [x] `cargo test --lib` — 80 tests. Nuevos:
+  - **ciclo de vida PTY con procesos reales**:
+    - crear con tamaño inicial (`stty size` = `24 80`) y escribir y leer UTF-8 (`hola ñandú`);
+    - redimensionar (`40 120`) y reengancharse con historial y `end` exactos;
+    - cerrar: evento de fin, proceso muerto y sin sesión.
+  - un programa que termina conserva su salida y su código (3) hasta que otra sesión lo sustituye;
+  - un proceso que ignora `SIGHUP` muere por `SIGKILL` tras la espera;
+  - el script del agente explica cómo instalarlo si falta el binario y lo ejecuta si está; variante fish;
+  - UTF-8 partido y recorte del historial;
+  - descartar un carril con su agente en marcha mata el proceso;
+  - `open -a` para Claude/Codex.
+- [x] `npm run build` OK
+- [x] Revisado en el navegador con IPC simulado:
+  - terminal enganchada con historial y lanzador;
+  - mensaje de binario no instalado;
+  - lo que se teclea llega una sola vez;
+  - botones Claude y Codex.
+  - Los archivos del mock se borraron después.
+- [ ] Probar en `Nude.app` con `claude` y `codex` reales (TUI a pantalla completa, redimensionado y `Detener`)
 

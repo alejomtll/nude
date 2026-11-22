@@ -48,12 +48,14 @@ pub async fn list_projects(db: State<'_, Database>) -> NudeResult<Vec<Project>> 
 pub async fn remove_project(
     db: State<'_, Database>,
     watcher: State<'_, WatcherHandle>,
+    pty: State<'_, crate::pty::PtyManager>,
     project_id: String,
 ) -> NudeResult<()> {
     let db = db.inner().clone();
     let watcher = watcher.inner().clone();
+    let pty = pty.inner().clone();
     blocking(move || {
-        super::lanes::forget_lanes_of(&db, &watcher, &project_id)?;
+        super::lanes::forget_lanes_of(&db, &watcher, &pty, &project_id)?;
         watcher.remove_project(&db, project_id)
     })
     .await

@@ -300,12 +300,14 @@ export function cleanPrompt(text: string | null | undefined): string {
 
 // ----------------------------------------------- Editores y firewall de archivos
 
-export type EditorId = "cursor" | "vscode" | "zed" | "finder";
+export type EditorId = "cursor" | "vscode" | "zed" | "finder" | "claude" | "codex";
 
 export interface EditorInfo {
   id: EditorId;
   name: string;
   installed: boolean;
+  /** `agent` = app nativa de un agente (Claude.app, Codex.app): solo carpetas. */
+  kind: "editor" | "agent";
 }
 
 export type GuardrailAction = "warn" | "auto_revert";
@@ -343,7 +345,7 @@ export interface OpenTarget {
 }
 
 const EDITOR_KEY = "nude.editor";
-const fallbackEditors: EditorInfo[] = [{ id: "finder", name: "Finder", installed: true }];
+const fallbackEditors: EditorInfo[] = [{ id: "finder", name: "Finder", installed: true, kind: "editor" }];
 
 export function joinPath(root: string, relative: string) {
   return `${root.replace(/\/+$/, "")}/${relative.replace(/^\/+/, "")}`;
@@ -351,7 +353,7 @@ export function joinPath(root: string, relative: string) {
 
 /** Editores instalados + el preferido (guardado en `localStorage`). */
 export function useEditors() {
-  const [editors, setEditors] = useState<EditorInfo[]>(fallbackEditors);
+  const [installed, setInstalled] = useState<EditorInfo[]>(fallbackEditors);
   const [preferred, setPreferredState] = useState<EditorId | null>(() => {
     try {
       return (window.localStorage.getItem(EDITOR_KEY) as EditorId | null) ?? null;
@@ -363,7 +365,7 @@ export function useEditors() {
   useEffect(() => {
     let active = true;
     invoke<EditorInfo[]>("list_editors").then(
-      (data) => { if (active) setEditors(data.filter((editor) => editor.installed)); },
+      (data) => { if (active) setInstalled(data.filter((editor) => editor.installed)); },
       () => undefined,
     );
     return () => { active = false; };
@@ -377,10 +379,13 @@ export function useEditors() {
       // Solo es una preferencia.
     }
   };
+  // Editores de código + Finder; las apps de agentes van aparte (no abren archivos).
+  const editors = installed.filter((editor) => editor.kind !== "agent");
+  const agentApps = installed.filter((editor) => editor.kind === "agent");
   const current = editors.find((editor) => editor.id === preferred)
     ?? editors.find((editor) => editor.id !== "finder")
     ?? editors[0];
-  return { editors, current, setPreferred };
+  return { editors, agentApps, current, setPreferred };
 }
 
 export function openInEditor(editor: EditorId, path: string, line: number | null = null) {
@@ -561,6 +566,48 @@ export interface Lane {
   checkpointCount: number;
   lastCheckpointAt: string | null;
   error: string | null;
+  /** Terminal embebida del carril (viva o terminada). */
+  terminal: PtyStatus | null;
+}
+
+/** Qué se lanza en la terminal de un carril. */
+export type LaneProgram = "claude-code" | "codex" | "opencode" | "shell";
+
+export const programLabels: Record<LaneProgram, string> = {
+  "claude-code": "Claude Code",
+  codex: "Codex",
+  opencode: "OpenCode",
+  shell: "Shell",
+};
+
+export interface PtyStatus {
+  sessionId: number;
+  program: LaneProgram;
+  running: boolean;
+  exitCode: number | null;
+  pid: number | null;
+}
+
+/** `spawn_lane_pty` / `attach_lane_pty`: estado + historial hasta `end`. */
+export interface PtyAttach extends PtyStatus {
+  laneId: string;
+  reused: boolean;
+  scrollback: string;
+  end: number;
+}
+
+export interface PtyOutput {
+  laneId: string;
+  sessionId: number;
+  data: string;
+  /** Offset en bytes UTF-8 al final de `data`. */
+  end: number;
+}
+
+export interface PtyExit {
+  laneId: string;
+  sessionId: number;
+  exitCode: number | null;
 }
 
 export interface LaneDiff {
@@ -632,6 +679,7 @@ export function useLanes(projectId: string | undefined, revision: number) {
       }, () => undefined);
     };
     subscribe<string>("lanes-changed", (changed) => { if (changed === projectId) soon(); });
+    subscribe<PtyExit>("lane-pty-exit", () => soon());
     subscribe<Checkpoint>("checkpoint-created", (checkpoint) => {
       if (laneProjects.current.has(checkpoint.projectId) || checkpoint.projectId === projectId) soon();
     });

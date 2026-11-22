@@ -17,6 +17,7 @@ use crate::db::Database;
 use crate::db::models::{AgentLane, ChangeType, Checkpoint, LaneStatus, Project, new_id};
 use crate::error::{NudeError, NudeResult};
 use crate::git::{self, LaneMerge};
+use crate::pty::{LaneProgram, PtyManager, PtyStatus};
 use crate::watcher::{self, HomeDir, WatcherHandle};
 
 /// Evento con el `project_id` cuando se crea, aplica o descarta un carril.
@@ -53,6 +54,8 @@ pub struct LaneSummary {
     pub last_checkpoint_at: Option<String>,
     /// El worktree no se pudo leer (p. ej. se borró a mano).
     pub error: Option<String>,
+    /// Terminal embebida del carril (viva o terminada), si la hay.
+    pub terminal: Option<PtyStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -83,7 +86,7 @@ fn lane_or_404(db: &Database, lane_id: &str) -> NudeResult<AgentLane> {
         .ok_or_else(|| NudeError::NotFound(format!("carril {lane_id}")))
 }
 
-fn active_lane(db: &Database, lane_id: &str) -> NudeResult<AgentLane> {
+pub(super) fn active_lane(db: &Database, lane_id: &str) -> NudeResult<AgentLane> {
     let lane = lane_or_404(db, lane_id)?;
     if lane.status != LaneStatus::Active {
         return Err(NudeError::GitOperation(format!("el carril «{}» ya está cerrado", lane.name)));
@@ -142,7 +145,7 @@ pub(crate) fn create_lane(
     }
 }
 
-fn summarize(db: &Database, home: &Path, project: &Project, lane: AgentLane) -> LaneSummary {
+fn summarize(db: &Database, home: &Path, pty: &PtyManager, project: &Project, lane: AgentLane) -> LaneSummary {
     let lane_path = Path::new(&lane.worktree_path);
     let inner = db.lane_project(&lane).ok().flatten();
     let checkpoints = inner
@@ -170,16 +173,17 @@ fn summarize(db: &Database, home: &Path, project: &Project, lane: AgentLane) -> 
         checkpoint_count: checkpoints.len(),
         last_checkpoint_at: checkpoints.first().map(|c| c.created_at.clone()),
         error,
+        terminal: pty.status(&lane.id),
         lane,
     }
 }
 
-pub(crate) fn list_lanes(db: &Database, home: &Path, project_id: &str) -> NudeResult<Vec<LaneSummary>> {
+pub(crate) fn list_lanes(db: &Database, home: &Path, pty: &PtyManager, project_id: &str) -> NudeResult<Vec<LaneSummary>> {
     let project = project_or_404(db, project_id)?;
     Ok(db
         .list_active_lanes(project_id)?
         .into_iter()
-        .map(|lane| summarize(db, home, &project, lane))
+        .map(|lane| summarize(db, home, pty, &project, lane))
         .collect())
 }
 
@@ -190,8 +194,17 @@ pub(crate) fn lane_diff(db: &Database, lane_id: &str) -> NudeResult<LaneDiffResp
     Ok(LaneDiffResponse { lane_id: lane.id, diff })
 }
 
-/// Deja de vigilar el carril y borra su worktree y su rama.
-fn close_lane(db: &Database, watcher: &WatcherHandle, base: &Path, project: &Project, lane: &AgentLane) -> NudeResult<()> {
+/// Cierra su terminal, deja de vigilar el carril y borra su worktree y su rama.
+fn close_lane(
+    db: &Database,
+    watcher: &WatcherHandle,
+    pty: &PtyManager,
+    base: &Path,
+    project: &Project,
+    lane: &AgentLane,
+) -> NudeResult<()> {
+    // Primero el proceso: el agente tiene su `cwd` dentro del worktree.
+    pty.kill(&lane.id);
     if let Some(inner) = db.lane_project(lane)? {
         watcher.remove_project(db, inner.id)?;
     }
@@ -206,6 +219,7 @@ fn close_lane(db: &Database, watcher: &WatcherHandle, base: &Path, project: &Pro
 pub(crate) fn merge_lane(
     db: &Database,
     watcher: &WatcherHandle,
+    pty: &PtyManager,
     home: &Path,
     base: &Path,
     lane_id: &str,
@@ -251,7 +265,7 @@ pub(crate) fn merge_lane(
         }),
         LaneMerge::Merged { commit_id, branch, files } => {
             db.set_lane_status(&lane.id, LaneStatus::Merged)?;
-            let cleanup_error = close_lane(db, watcher, base, &project, &lane).err().map(|e| e.to_string());
+            let cleanup_error = close_lane(db, watcher, pty, base, &project, &lane).err().map(|e| e.to_string());
             Ok(MergeLaneResult {
                 merged: true,
                 conflicts: Vec::new(),
@@ -265,17 +279,26 @@ pub(crate) fn merge_lane(
     }
 }
 
-pub(crate) fn discard_lane(db: &Database, watcher: &WatcherHandle, base: &Path, lane_id: &str) -> NudeResult<AgentLane> {
+pub(crate) fn discard_lane(
+    db: &Database,
+    watcher: &WatcherHandle,
+    pty: &PtyManager,
+    base: &Path,
+    lane_id: &str,
+) -> NudeResult<AgentLane> {
     let lane = active_lane(db, lane_id)?;
     let project = project_or_404(db, &lane.project_id)?;
-    close_lane(db, watcher, base, &project, &lane)?;
+    close_lane(db, watcher, pty, base, &project, &lane)?;
     db.set_lane_status(&lane.id, LaneStatus::Discarded)?;
     Ok(AgentLane { status: LaneStatus::Discarded, ..lane })
 }
 
 /// Al quitar un proyecto de Nude se dejan de vigilar sus carriles. Sus
 /// worktrees se conservan en disco (`git worktree list` los sigue mostrando).
-pub(crate) fn forget_lanes_of(db: &Database, watcher: &WatcherHandle, project_id: &str) -> NudeResult<()> {
+pub(crate) fn forget_lanes_of(db: &Database, watcher: &WatcherHandle, pty: &PtyManager, project_id: &str) -> NudeResult<()> {
+    for lane in db.list_active_lanes(project_id)? {
+        pty.kill(&lane.id);
+    }
     for inner in db.lane_projects_of(project_id)? {
         watcher.remove_project(db, inner)?;
     }
@@ -291,21 +314,31 @@ fn emit_lanes_changed(app: &AppHandle, project_id: &str) {
 // ------------------------------------------------------------------- comandos
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn create_parallel_lane(
     app: AppHandle,
     db: State<'_, Database>,
     home: State<'_, HomeDir>,
     watcher: State<'_, WatcherHandle>,
     lanes: State<'_, LaneRoot>,
+    pty: State<'_, PtyManager>,
     project_id: String,
     name: String,
     agent_hint: Option<String>,
 ) -> NudeResult<LaneSummary> {
     let (db, home, watcher, base) = (db.inner().clone(), home.0.clone(), watcher.inner().clone(), lanes.0.clone());
+    let pty = pty.inner().clone();
     let summary = blocking(move || {
         let lane = create_lane(&db, &watcher, &base, &project_id, &name, agent_hint.as_deref())?;
+        // Con preset, el agente arranca ya en su terminal; la UI la redimensiona
+        // al engancharse. Si falla, el carril sigue creado y se puede reintentar.
+        if let Some(program) = lane.agent_hint.as_deref().and_then(LaneProgram::from_hint) {
+            if let Err(e) = pty.spawn_program(&lane.id, Path::new(&lane.worktree_path), program, 120, 32) {
+                eprintln!("nude: no se pudo abrir la terminal del carril: {e}");
+            }
+        }
         let project = project_or_404(&db, &lane.project_id)?;
-        Ok(summarize(&db, &home, &project, lane))
+        Ok(summarize(&db, &home, &pty, &project, lane))
     })
     .await?;
     emit_lanes_changed(&app, &summary.lane.project_id);
@@ -316,10 +349,11 @@ pub async fn create_parallel_lane(
 pub async fn list_parallel_lanes(
     db: State<'_, Database>,
     home: State<'_, HomeDir>,
+    pty: State<'_, PtyManager>,
     project_id: String,
 ) -> NudeResult<Vec<LaneSummary>> {
-    let (db, home) = (db.inner().clone(), home.0.clone());
-    blocking(move || list_lanes(&db, &home, &project_id)).await
+    let (db, home, pty) = (db.inner().clone(), home.0.clone(), pty.inner().clone());
+    blocking(move || list_lanes(&db, &home, &pty, &project_id)).await
 }
 
 #[tauri::command]
@@ -336,13 +370,15 @@ pub async fn merge_parallel_lane(
     home: State<'_, HomeDir>,
     watcher: State<'_, WatcherHandle>,
     lanes: State<'_, LaneRoot>,
+    pty: State<'_, PtyManager>,
     lane_id: String,
     resolve_conflicts: Option<bool>,
 ) -> NudeResult<MergeLaneResult> {
     let (db, home, watcher, base) = (db.inner().clone(), home.0.clone(), watcher.inner().clone(), lanes.0.clone());
+    let pty = pty.inner().clone();
     let (project_id, result) = blocking(move || {
         let project_id = lane_or_404(&db, &lane_id)?.project_id;
-        let result = merge_lane(&db, &watcher, &home, &base, &lane_id, resolve_conflicts.unwrap_or(false))?;
+        let result = merge_lane(&db, &watcher, &pty, &home, &base, &lane_id, resolve_conflicts.unwrap_or(false))?;
         Ok((project_id, result))
     })
     .await?;
@@ -361,10 +397,11 @@ pub async fn discard_parallel_lane(
     db: State<'_, Database>,
     watcher: State<'_, WatcherHandle>,
     lanes: State<'_, LaneRoot>,
+    pty: State<'_, PtyManager>,
     lane_id: String,
 ) -> NudeResult<AgentLane> {
-    let (db, watcher, base) = (db.inner().clone(), watcher.inner().clone(), lanes.0.clone());
-    let lane = blocking(move || discard_lane(&db, &watcher, &base, &lane_id)).await?;
+    let (db, watcher, base, pty) = (db.inner().clone(), watcher.inner().clone(), lanes.0.clone(), pty.inner().clone());
+    let lane = blocking(move || discard_lane(&db, &watcher, &pty, &base, &lane_id)).await?;
     emit_lanes_changed(&app, &lane.project_id);
     Ok(lane)
 }

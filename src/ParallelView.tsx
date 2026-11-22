@@ -1,13 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
 import {
-  ChevronDown, Code, Copy, FolderOpen, GitBranch, GitMerge, Plus, RefreshCw, Trash2, TriangleAlert,
+  Bot, ChevronDown, Code, Copy, FileDiff as FileDiffIcon, FolderOpen, GitBranch, GitMerge, Plus, RefreshCw,
+  SquareTerminal, Trash2, TriangleAlert,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { UnifiedPatch, type Editors } from "./DiffInspector";
 import {
-  agentLabels, cdCommand, copyText, errorMessage, fileCount, openInEditor, tildePath,
+  agentLabels, cdCommand, copyText, errorMessage, openInEditor, tildePath,
   type AgentTool, type Lane, type LaneDiff, type Project, type Resource,
 } from "./workspace";
+
+// xterm.js solo se descarga al abrir la vista Paralelo.
+const LaneTerminal = lazy(() => import("./LaneTerminal").then((module) => ({ default: module.LaneTerminal })));
 
 const relative = new Intl.RelativeTimeFormat("es", { numeric: "auto" });
 const markers = { added: "A", modified: "M", deleted: "D" } as const;
@@ -165,6 +169,9 @@ function LaneColumn({ lane, fresh, editors, onMerge, onDiscard, onNotice }: {
   const conflicts = useMemo(() => new Set(lane.conflicts), [lane.conflicts]);
   const files = diff?.files ?? [];
   const selected = files.find((file) => file.filePath === selectedPath) ?? files[0];
+  // «Terminal» por defecto si el carril tiene (o tendrá) un agente CLI.
+  const [tab, setTab] = useState<"terminal" | "changes">(() =>
+    lane.terminal || (lane.agentHint && lane.agentHint !== "manual") ? "terminal" : "changes");
 
   useEffect(() => {
     if (fresh) column.current?.scrollIntoView({ behavior: "smooth", inline: "nearest", block: "nearest" });
@@ -205,30 +212,51 @@ function LaneColumn({ lane, fresh, editors, onMerge, onDiscard, onNotice }: {
             <Copy size={11} aria-hidden="true" />
             <span className="truncate">cd {tildePath(lane.worktreePath)}</span>
           </button>
-          {editors.editors.map((editor) => (
+          {[...editors.editors, ...editors.agentApps].map((editor) => (
             <button key={editor.id} className="icon-button" title={editor.id === "finder" ? "Mostrar en Finder" : `Abrir en ${editor.name}`}
               aria-label={editor.id === "finder" ? "Mostrar carril en Finder" : `Abrir carril en ${editor.name}`}
+              data-kind={editor.kind}
               onClick={() => openInEditor(editor.id, lane.worktreePath).catch((reason: unknown) => onNotice(errorMessage(reason)))}>
-              {editor.id === "finder" ? <FolderOpen size={13} aria-hidden="true" /> : <Code size={13} aria-hidden="true" />}
+              {editor.id === "finder" ? <FolderOpen size={13} aria-hidden="true" />
+                : editor.kind === "agent" ? <Bot size={13} aria-hidden="true" /> : <Code size={13} aria-hidden="true" />}
               <span className="lane-editor-name">{editor.id === "finder" ? "Finder" : editor.name}</span>
             </button>
           ))}
         </div>
       </header>
 
-      {lane.error ? (
+      <div className="lane-tabs" role="tablist" aria-label={`Vista del carril ${lane.name}`}>
+        <button role="tab" aria-selected={tab === "terminal"} onClick={() => setTab("terminal")}>
+          <SquareTerminal size={12} aria-hidden="true" />Terminal
+          {lane.terminal?.running && <span className="tab-live" aria-label="en marcha" />}
+        </button>
+        <button role="tab" aria-selected={tab === "changes"} onClick={() => setTab("changes")}>
+          <FileDiffIcon size={12} aria-hidden="true" />Cambios ({lane.files.length})
+        </button>
+        <span className="lane-tabs-meta text-faint" title={`${lane.checkpointCount} checkpoints del carril`}>
+          {lane.conflicts.length > 0 ? (
+            <span className="lane-conflict" title={lane.conflicts.join("\n")}>
+              <TriangleAlert size={11} aria-hidden="true" />{lane.conflicts.length} en conflicto con {target}
+            </span>
+          ) : `${lane.checkpointCount} checkpoints`}
+        </span>
+      </div>
+
+      {/* La terminal sigue montada (y su proceso vivo) aunque se mire el diff. */}
+      <div className="lane-panel" hidden={tab !== "terminal"}>
+        {lane.error
+          ? <div className="inline-error" role="alert"><span>{lane.error}</span></div>
+          : (
+            <Suspense fallback={<div className="empty-state" role="status">Cargando terminal…</div>}>
+              <LaneTerminal laneId={lane.id} preset={lane.agentHint} visible={tab === "terminal"} onNotice={onNotice} />
+            </Suspense>
+          )}
+      </div>
+
+      {tab === "changes" && (lane.error ? (
         <div className="inline-error" role="alert"><span>{lane.error}</span></div>
       ) : (
-        <>
-          <div className="lane-summary">
-            <span>{lane.files.length ? fileCount(lane.files.length) : "Sin cambios"}</span>
-            <span className="text-faint">· {lane.checkpointCount} checkpoints</span>
-            {lane.conflicts.length > 0 && (
-              <span className="lane-conflict" title={lane.conflicts.join("\n")}>
-                <TriangleAlert size={11} aria-hidden="true" />{lane.conflicts.length} en conflicto con {target}
-              </span>
-            )}
-          </div>
+        <div className="lane-panel">
           {files.length > 0 && (
             <ul className="file-list lane-files">
               {files.map((file) => (
@@ -249,10 +277,10 @@ function LaneColumn({ lane, fresh, editors, onMerge, onDiscard, onNotice }: {
                 ? <UnifiedPatch key={selected.filePath} patch={selected.patchText} />
                 : <div className="empty-state">Archivo binario o demasiado grande para mostrar.</div>)
               : !diff && lane.files.length ? <div className="empty-state" role="status">Cargando diff…</div>
-              : <div className="empty-state">Abre el carril con tu agente; sus cambios aparecerán aquí.</div>}
+              : <div className="empty-state">{lane.files.length ? "Sin diff." : "Todavía sin cambios. Lanza un agente en la terminal o ábrelo en tu app."}</div>}
           </div>
-        </>
-      )}
+        </div>
+      ))}
 
       <footer className="lane-footer">
         <button className="button button-primary" disabled={!lane.files.length || Boolean(lane.error)} onClick={onMerge}

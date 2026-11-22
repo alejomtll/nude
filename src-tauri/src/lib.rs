@@ -3,11 +3,12 @@ mod db;
 mod error;
 mod git;
 mod preview;
+mod pty;
 mod safety;
 mod watcher;
 
 use tauri::menu::{Menu, MenuItem, Submenu};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, RunEvent};
 
 const MENU_COMMAND_PALETTE: &str = "open-command-palette";
 /// Evento hacia el frontend cuando se usa el acelerador nativo de ⌘K.
@@ -105,6 +106,18 @@ pub fn run() {
             app.manage(database);
             app.manage(watcher::HomeDir(home));
             app.manage(commands::lanes::LaneRoot(data_dir.join("worktrees")));
+
+            // Terminales embebidas de los carriles: salida y fin como eventos.
+            let handle = app.handle().clone();
+            app.manage(pty::PtyManager::new(move |event| {
+                let result = match event {
+                    pty::PtyEvent::Output(output) => handle.emit(pty::EVENT_PTY_OUTPUT, output),
+                    pty::PtyEvent::Exit(exit) => handle.emit(pty::EVENT_PTY_EXIT, exit),
+                };
+                if let Err(e) = result {
+                    eprintln!("nude: no se pudo emitir la salida del terminal: {e}");
+                }
+            }));
             app.manage(watcher_handle);
             Ok(())
         })
@@ -139,7 +152,20 @@ pub fn run() {
             commands::lanes::get_lane_diff,
             commands::lanes::merge_parallel_lane,
             commands::lanes::discard_parallel_lane,
+            commands::pty::spawn_lane_pty,
+            commands::pty::attach_lane_pty,
+            commands::pty::write_lane_pty,
+            commands::pty::resize_lane_pty,
+            commands::pty::kill_lane_pty,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app, event| {
+            // Al salir no quedan agentes huérfanos ejecutándose en los carriles.
+            if let RunEvent::Exit = event {
+                if let Some(pty) = app.try_state::<pty::PtyManager>() {
+                    pty.kill_all();
+                }
+            }
+        });
 }

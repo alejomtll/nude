@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use git2::{BranchType, Repository, RepositoryInitOptions, Signature};
 
 use super::*;
+use crate::pty::PtyManager;
 use crate::watcher;
 
 struct Sandbox(PathBuf);
@@ -86,7 +87,7 @@ fn two_parallel_lanes_edit_the_same_file_one_is_merged_and_the_other_discarded()
     fs::write(Path::new(&b.worktree_path).join("app.txt"), "versión del agente B\n").expect("write B");
     fs::write(Path::new(&b.worktree_path).join("extra.txt"), "solo en B\n").expect("write B extra");
 
-    let lanes = list_lanes(&db, &home, &project.id).expect("list");
+    let lanes = list_lanes(&db, &home, &PtyManager::new(|_| {}), &project.id).expect("list");
     assert_eq!(lanes.len(), 2);
     let files = |s: &LaneSummary| s.files.iter().map(|f| f.file_path.clone()).collect::<Vec<_>>();
     assert_eq!(files(&lanes[0]), ["app.txt"]);
@@ -102,7 +103,7 @@ fn two_parallel_lanes_edit_the_same_file_one_is_merged_and_the_other_discarded()
     assert!(repo.statuses(None).expect("status").is_empty());
 
     // 3. Se aplica A a main con un merge --no-ff.
-    let merged = merge_lane(&db, &watcher, &home, &lanes_base, &a.id, false).expect("merge A");
+    let merged = merge_lane(&db, &watcher, &PtyManager::new(|_| {}), &home, &lanes_base, &a.id, false).expect("merge A");
     assert!(merged.merged, "{merged:?}");
     assert_eq!(merged.branch.as_deref(), Some("main"));
     assert_eq!(merged.cleanup_error, None);
@@ -117,17 +118,34 @@ fn two_parallel_lanes_edit_the_same_file_one_is_merged_and_the_other_discarded()
     assert!(db.get_project(&inner_a.id).expect("inner").is_none(), "ya no se vigila");
 
     // B tocó lo mismo: ahora choca y no se aplica sin confirmación.
-    let lanes = list_lanes(&db, &home, &project.id).expect("list");
+    let lanes = list_lanes(&db, &home, &PtyManager::new(|_| {}), &project.id).expect("list");
     assert_eq!(lanes.len(), 1);
     assert_eq!(lanes[0].conflicts, ["app.txt"]);
-    let refused = merge_lane(&db, &watcher, &home, &lanes_base, &b.id, false).expect("merge B");
+    let refused = merge_lane(&db, &watcher, &PtyManager::new(|_| {}), &home, &lanes_base, &b.id, false).expect("merge B");
     assert!(!refused.merged);
     assert_eq!(refused.conflicts, ["app.txt"]);
     assert!(refused.checkpoints.is_empty(), "sin confirmar no se toca nada");
     assert_eq!(head_id(&repo), head.id());
 
-    // 4. Se descarta B: sin carpetas ni ramas, y main intacto.
-    let discarded = discard_lane(&db, &watcher, &lanes_base, &b.id).expect("discard B");
+    // 4. Se descarta B (con su agente aún en marcha en la terminal): sin
+    // proceso, carpetas ni ramas, y main intacto.
+    let pty = PtyManager::new(|_| {});
+    let mut agent = portable_pty::CommandBuilder::new("/bin/sh");
+    agent.args(["-c", "sleep 30"]);
+    agent.cwd(&b.worktree_path);
+    let session = pty
+        .spawn_command(&b.id, crate::pty::LaneProgram::Codex, agent, 80, 24)
+        .expect("terminal de B");
+    let pid = session.status.pid.expect("pid") as i32;
+    assert!(list_lanes(&db, &home, &pty, &project.id).expect("list")[0].terminal.as_ref().is_some_and(|t| t.running));
+    let discarded = discard_lane(&db, &watcher, &pty, &lanes_base, &b.id).expect("discard B");
+    assert!(pty.status(&b.id).is_none(), "terminal cerrada al descartar");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    // SAFETY: la señal 0 solo comprueba si el proceso existe.
+    while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(unsafe { libc::kill(pid, 0) } != 0, "el agente del carril sigue vivo");
     assert_eq!(discarded.status, LaneStatus::Discarded);
     assert!(!Path::new(&b.worktree_path).exists());
     assert!(!lane_dir.exists(), "carpeta del proyecto en worktrees/ eliminada");
@@ -136,8 +154,8 @@ fn two_parallel_lanes_edit_the_same_file_one_is_merged_and_the_other_discarded()
     assert_eq!(head_id(&repo), head.id());
     assert_eq!(fs::read_to_string(root.join("app.txt")).expect("main"), "línea 1\nversión del agente A\n");
     assert!(!root.join("extra.txt").exists());
-    assert!(list_lanes(&db, &home, &project.id).expect("list").is_empty());
-    assert!(discard_lane(&db, &watcher, &lanes_base, &b.id).is_err(), "un carril cerrado no se cierra dos veces");
+    assert!(list_lanes(&db, &home, &PtyManager::new(|_| {}), &project.id).expect("list").is_empty());
+    assert!(discard_lane(&db, &watcher, &PtyManager::new(|_| {}), &lanes_base, &b.id).is_err(), "un carril cerrado no se cierra dos veces");
 }
 
 #[test]
@@ -157,7 +175,7 @@ fn applying_a_lane_never_overwrites_unsaved_work_and_conflicts_can_take_the_lane
     // Cambio local sin guardar en main sobre el mismo archivo: no se pisa.
     fs::write(root.join("app.txt"), "sin guardar en main\n").expect("dirty main");
     let before = head_id(&repo);
-    let err = merge_lane(&db, &watcher, &home, &lanes_base, &lane.id, false).expect_err("checkout seguro");
+    let err = merge_lane(&db, &watcher, &PtyManager::new(|_| {}), &home, &lanes_base, &lane.id, false).expect_err("checkout seguro");
     assert!(err.to_string().contains("cambios sin guardar"), "{err}");
     assert_eq!(head_id(&repo), before, "HEAD no se movió");
     assert_eq!(fs::read_to_string(root.join("app.txt")).expect("main"), "sin guardar en main\n");
@@ -173,9 +191,9 @@ fn applying_a_lane_never_overwrites_unsaved_work_and_conflicts_can_take_the_lane
     let sig = Signature::now("Tester", "tester@example.com").expect("sig");
     repo.commit(Some("HEAD"), &sig, &sig, "main avanza", &tree, &[&parent]).expect("commit");
 
-    let refused = merge_lane(&db, &watcher, &home, &lanes_base, &lane.id, false).expect("preview");
+    let refused = merge_lane(&db, &watcher, &PtyManager::new(|_| {}), &home, &lanes_base, &lane.id, false).expect("preview");
     assert_eq!(refused.conflicts, ["app.txt"]);
-    let merged = merge_lane(&db, &watcher, &home, &lanes_base, &lane.id, true).expect("resolve");
+    let merged = merge_lane(&db, &watcher, &PtyManager::new(|_| {}), &home, &lanes_base, &lane.id, true).expect("resolve");
     assert!(merged.merged, "{merged:?}");
     assert_eq!(fs::read_to_string(root.join("app.txt")).expect("main"), "del carril\n");
     assert!(repo.statuses(None).expect("status").is_empty());
@@ -195,11 +213,11 @@ fn a_lane_whose_folder_was_deleted_by_hand_can_still_be_discarded() {
 
     let lane = create_lane(&db, &watcher, &lanes_base, &project.id, "Borrado a mano", None).expect("lane");
     fs::remove_dir_all(&lane.worktree_path).expect("rm");
-    let lanes = list_lanes(&db, &home, &project.id).expect("list");
+    let lanes = list_lanes(&db, &home, &PtyManager::new(|_| {}), &project.id).expect("list");
     assert!(lanes[0].error.is_some(), "la columna muestra el error");
 
-    discard_lane(&db, &watcher, &lanes_base, &lane.id).expect("discard");
+    discard_lane(&db, &watcher, &PtyManager::new(|_| {}), &lanes_base, &lane.id).expect("discard");
     assert!(lane_branches(&repo).is_empty());
     assert!(repo.worktrees().expect("worktrees").is_empty());
-    assert!(list_lanes(&db, &home, &project.id).expect("list").is_empty());
+    assert!(list_lanes(&db, &home, &PtyManager::new(|_| {}), &project.id).expect("list").is_empty());
 }

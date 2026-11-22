@@ -35,6 +35,9 @@ pub enum NudeError {
     #[error("el estado interno quedó inconsistente (mutex envenenado)")]
     LockPoisoned,
 
+    #[error("terminal: {0}")]
+    Pty(String),
+
     #[error("la tarea en segundo plano falló: {0}")]
     Task(String),
 }
