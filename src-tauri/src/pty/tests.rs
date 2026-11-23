@@ -9,6 +9,7 @@ use super::*;
 enum Seen {
     Out(PtyOutput),
     Exit(PtyExit),
+    Status(PtyActivityChange),
 }
 
 fn manager() -> (PtyManager, Receiver<Seen>) {
@@ -18,6 +19,7 @@ fn manager() -> (PtyManager, Receiver<Seen>) {
         let seen = match event {
             PtyEvent::Output(out) => Seen::Out(out.clone()),
             PtyEvent::Exit(exit) => Seen::Exit(exit.clone()),
+            PtyEvent::Status(change) => Seen::Status(change.clone()),
         };
         let _ = lock(&tx).send(seen);
     });
@@ -44,6 +46,7 @@ fn wait_output(rx: &Receiver<Seen>, text: &mut String, needle: &str) -> u64 {
                 end = out.end;
             }
             Ok(Seen::Exit(exit)) => panic!("el proceso terminó antes de mostrar «{needle}»: {exit:?}\n{text}"),
+            Ok(Seen::Status(_)) => continue,
             Err(_) => panic!("no apareció «{needle}» en:\n{text}"),
         }
     }
@@ -55,7 +58,7 @@ fn wait_exit(rx: &Receiver<Seen>) -> PtyExit {
     loop {
         match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(Seen::Exit(exit)) => return exit,
-            Ok(Seen::Out(_)) => continue,
+            Ok(Seen::Out(_) | Seen::Status(_)) => continue,
             Err(_) => panic!("el proceso no terminó"),
         }
     }
@@ -204,4 +207,39 @@ fn split_utf8_sequences_and_long_histories_are_handled() {
     assert!(output.text.len() <= MAX_SCROLLBACK);
     assert!(output.text.starts_with("123456789"), "se corta por líneas");
     assert_eq!(output.end as usize, (MAX_SCROLLBACK / 10 + 100) * 10);
+}
+
+/// Espera al siguiente cambio de estado en vivo (ignora la salida).
+fn wait_status(rx: &Receiver<Seen>, within: Duration) -> PtyActivityChange {
+    let deadline = Instant::now() + within;
+    loop {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Seen::Status(change)) => return change,
+            // `lane-pty-exit` llega justo antes que el estado `exited`.
+            Ok(Seen::Out(_) | Seen::Exit(_)) => continue,
+            Err(_) => panic!("no hubo cambio de estado en {within:?}"),
+        }
+    }
+}
+
+#[test]
+fn live_status_goes_working_needs_attention_working_exited() {
+    let (pty, rx) = manager();
+    let script = "echo preparando; printf '¿Aplicar el cambio? (y/n) '; read answer; \
+                  i=0; while [ $i -lt 8 ]; do echo \"trabajando $answer $i\"; i=$((i+1)); sleep 0.2; done";
+    let started = Instant::now();
+    let attach = pty.spawn_command("lane-s", LaneProgram::ClaudeCode, sh(script), 80, 24).expect("spawn");
+    assert_eq!(attach.status.activity, LaneActivity::Working);
+
+    let waiting = wait_status(&rx, Duration::from_secs(8));
+    assert_eq!(waiting.activity, LaneActivity::NeedsAttention);
+    assert_eq!(waiting.program, LaneProgram::ClaudeCode);
+    assert_eq!(waiting.session_id, attach.status.session_id);
+    assert!(started.elapsed() >= activity::QUIET_AFTER, "solo tras 3 s de silencio");
+    assert_eq!(pty.status("lane-s").expect("status").activity, LaneActivity::NeedsAttention);
+
+    pty.write("lane-s", "y\r").expect("write");
+    assert_eq!(wait_status(&rx, Duration::from_secs(5)).activity, LaneActivity::Working);
+    assert_eq!(wait_status(&rx, Duration::from_secs(10)).activity, LaneActivity::Exited);
+    assert_eq!(pty.status("lane-s").expect("status").activity, LaneActivity::Exited);
 }

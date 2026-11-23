@@ -6,8 +6,8 @@ import "@xterm/xterm/css/xterm.css";
 import { Play, RotateCcw, Square, SquareTerminal } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import {
-  errorMessage, programLabels,
-  type AgentTool, type LaneProgram, type PtyAttach, type PtyExit, type PtyOutput, type PtyStatus,
+  activityLabels, errorMessage, programLabels,
+  type AgentTool, type LaneProgram, type PtyActivityChange, type PtyAttach, type PtyExit, type PtyOutput, type PtyStatus,
 } from "./workspace";
 
 /** Paleta neutra (la de la app): fondo #121212, texto #E5E5E5, cursor #A3A3A3. */
@@ -98,7 +98,7 @@ export function LaneTerminal({ laneId, preset, visible, onNotice }: {
   async function stop() {
     try {
       await invoke("kill_lane_pty", { laneId });
-      setStatus((current) => current && { ...current, running: false });
+      setStatus((current) => current && { ...current, running: false, activity: "exited" });
     } catch (reason) {
       onNotice(errorMessage(reason));
     }
@@ -164,7 +164,12 @@ export function LaneTerminal({ laneId, preset, visible, onNotice }: {
       }),
       subscribe<PtyExit>("lane-pty-exit", (exit) => {
         if (exit.laneId !== laneId || exit.sessionId !== session.current?.id) return;
-        setStatus((current) => current && { ...current, running: false, exitCode: exit.exitCode });
+        setStatus((current) => current && { ...current, running: false, exitCode: exit.exitCode, activity: "exited" });
+      }),
+      subscribe<PtyActivityChange>("lane-pty-status", (change) => {
+        if (change.laneId !== laneId || change.sessionId !== session.current?.id) return;
+        setStatus((current) => current && current.sessionId === change.sessionId
+          ? { ...current, activity: change.activity } : current);
       }),
     ]).then(async () => {
       if (!active) return;
@@ -209,11 +214,13 @@ export function LaneTerminal({ laneId, preset, visible, onNotice }: {
       <div className="lane-terminal-bar">
         {status ? (
           <>
-            <span className="lane-terminal-state" data-running={running || undefined}>
+            <span className="lane-terminal-state" data-activity={running ? status.activity : "exited"}>
               <span className="state-dot" aria-hidden="true" />
               {programLabels[status.program]}
               <span className="text-faint">
-                {running ? "en marcha" : `terminado${status.exitCode !== null ? ` (código ${status.exitCode})` : ""}`}
+                {running
+                  ? activityLabels[status.activity].toLowerCase()
+                  : `terminado${status.exitCode !== null ? ` (código ${status.exitCode})` : ""}`}
               </span>
             </span>
             {running ? (

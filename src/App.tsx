@@ -11,6 +11,7 @@ import { CommandPalette, type PaletteCommand } from "./CommandPalette";
 import { DiffInspector, type Editors } from "./DiffInspector";
 import { type GraphAction, GitGraphView } from "./GitGraphView";
 import { GuardrailToasts, GuardrailsButton } from "./Guardrails";
+import { ActivityDot, LaneAuditPanel } from "./LaneAudit";
 import { ParallelView } from "./ParallelView";
 import { PreviewButton } from "./Preview";
 import { TimeScrubber } from "./TimeScrubber";
@@ -19,9 +20,9 @@ import { LiveIndicator } from "./WatcherStatus";
 import { Wordmark } from "./Wordmark";
 import {
   agentLabels, cdCommand, cleanPrompt, compareCheckpointsAsc, copyText, createLane, errorMessage, fileCount, openInEditor,
-  suggestedBranchName, tildePath, useCheckpoints, useEditors, useGuardrailAlerts, useLanes, useUndoPlan,
+  overallActivity, suggestedBranchName, tildePath, useCheckpoints, useEditors, useGuardrailAlerts, useLanes, useUndoPlan,
   type AgentTool, type Checkpoint, type Lane, type MergeLaneResult, type OpenTarget, type Project, type Resource,
-  type UndoAgentPlan,
+  type TerminalActivity, type UndoAgentPlan,
 } from "./workspace";
 import "./App.css";
 
@@ -196,6 +197,7 @@ function ActionDialog({ action, close, submit }: {
         {action.kind === "mergeLane" && (
           <>
             <p>Se aplicarán los cambios de <strong>{action.lane.name}</strong> ({fileCount(action.lane.files.length)}) sobre <strong>{action.lane.baseBranch ?? "la rama actual"}</strong> con un commit de merge (<span className="mono">--no-ff</span>). Nude guarda antes un checkpoint y, si el merge pisara cambios sin guardar, no toca nada. Después se borran el worktree y la rama <span className="mono">{action.lane.branchName}</span>.</p>
+            <LaneAuditPanel lane={action.lane} variant="dialog" />
             {laneConflicts.length > 0 && (
               <div className="lane-conflict-list" role="alert">
                 <p>Estos archivos también cambiaron en {action.lane.baseBranch ?? "la rama actual"}. Si continúas, se usará la versión del carril:</p>
@@ -373,9 +375,11 @@ function TimelineView({
   );
 }
 
-function TopBar({ view, setView, project, revision, laneCount, onUndo, guardOpen, setGuardOpen, onPalette, onPreviewUrl }: {
+function TopBar({ view, setView, project, revision, laneCount, laneActivity, onUndo, guardOpen, setGuardOpen, onPalette, onPreviewUrl }: {
   project: Project;
   laneCount: number;
+  /** Estado más urgente de las terminales de los carriles. */
+  laneActivity: TerminalActivity | null;
   view: View;
   setView: (view: View) => void;
   revision: number;
@@ -397,7 +401,13 @@ function TopBar({ view, setView, project, revision, laneCount, onUndo, guardOpen
         <button role="tab" aria-selected={view === "parallel"} onClick={() => setView("parallel")}
           title="Carriles paralelos: un worktree aislado por agente">
           Paralelo
-          {laneCount > 0 && <span className="tab-count" aria-label={`${laneCount} carriles activos`}>{laneCount}</span>}
+          {laneCount > 0 && (
+            <span className="tab-count" data-activity={laneActivity ?? undefined}
+              aria-label={`${laneCount} carriles activos${laneActivity === "needs_attention" ? ", alguno espera respuesta" : ""}`}>
+              {laneActivity && laneActivity !== "exited" && <ActivityDot activity={laneActivity} />}
+              {laneCount}
+            </span>
+          )}
         </button>
       </div>
       <div className="topbar-actions">
@@ -853,7 +863,7 @@ function App() {
             )}
           </aside>
           <TopBar key={`topbar:${project.id}`} project={project} view={view} setView={setView} revision={revision}
-            laneCount={activeLanes.length}
+            laneCount={activeLanes.length} laneActivity={overallActivity(activeLanes)}
             onUndo={(plan) => setAction({ kind: "undo", project, plan })}
             guardOpen={guardOpen} setGuardOpen={setGuardOpen} onPalette={() => setPalette(true)}
             onPreviewUrl={(previewUrl) => setProjects((previous) => ({

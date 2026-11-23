@@ -11,13 +11,17 @@
 //! offset final en bytes de ese trozo: el frontend descarta lo que ya pintó
 //! con el historial.
 //!
+//! Un hilo de supervisión clasifica cada sesión (`activity.rs`) en
+//! `working`, `needs_attention` o `exited` y emite `lane-pty-status` cuando
+//! cambia.
+//!
 //! Solo procesos locales; nada de red (AGENTS.md §2).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -25,10 +29,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{NudeError, NudeResult};
 
+mod activity;
+
+use activity::ActivityTracker;
+pub use activity::LaneActivity;
+
 /// Evento Tauri con un trozo de salida (`PtyOutput`).
 pub const EVENT_PTY_OUTPUT: &str = "lane-pty-output";
 /// Evento Tauri cuando termina el proceso de una sesión (`PtyExit`).
 pub const EVENT_PTY_EXIT: &str = "lane-pty-exit";
+/// Evento Tauri cuando cambia el estado en vivo de una sesión (`PtyActivityChange`).
+pub const EVENT_PTY_STATUS: &str = "lane-pty-status";
+/// Cada cuánto revisa el supervisor si alguna sesión espera respuesta.
+const MONITOR_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Historial que se conserva por sesión para volver a engancharse.
 const MAX_SCROLLBACK: usize = 512 * 1024;
@@ -67,7 +80,7 @@ impl LaneProgram {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::ClaudeCode => "Claude Code",
             Self::Codex => "Codex",
@@ -114,10 +127,21 @@ pub struct PtyExit {
     pub exit_code: Option<u32>,
 }
 
+/// Cambio de estado en vivo (`working` → `needs_attention`…).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PtyActivityChange {
+    pub lane_id: String,
+    pub session_id: u64,
+    pub program: LaneProgram,
+    pub activity: LaneActivity,
+}
+
 /// Lo que el gestor comunica a la capa Tauri.
 pub enum PtyEvent<'a> {
     Output(&'a PtyOutput),
     Exit(&'a PtyExit),
+    Status(&'a PtyActivityChange),
 }
 
 /// Estado resumido (para `list_parallel_lanes`).
@@ -129,6 +153,8 @@ pub struct PtyStatus {
     pub running: bool,
     pub exit_code: Option<u32>,
     pub pid: Option<u32>,
+    /// Estado en vivo (`working`, `needs_attention`, `exited`).
+    pub activity: LaneActivity,
 }
 
 /// Sesión a la que se engancha la UI: estado + historial hasta `end`.
@@ -212,6 +238,7 @@ struct Session {
     output: Mutex<Output>,
     /// `None` mientras el proceso sigue vivo.
     exit: Mutex<Option<Option<u32>>>,
+    activity: Mutex<ActivityTracker>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -221,12 +248,14 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Session {
     fn status(&self) -> PtyStatus {
         let exit = *lock(&self.exit);
+        let activity = if exit.is_some() { LaneActivity::Exited } else { lock(&self.activity).state() };
         PtyStatus {
             session_id: self.id,
             program: self.program,
             running: exit.is_none(),
             exit_code: exit.flatten(),
             pid: self.pid,
+            activity,
         }
     }
 
@@ -268,12 +297,38 @@ impl PtyManager {
     /// `sink` recibe la salida y los finales de proceso (la capa Tauri los
     /// emite como eventos). Se llama desde hilos de lectura.
     pub fn new(sink: impl Fn(PtyEvent<'_>) + Send + Sync + 'static) -> Self {
-        Self {
+        let manager = Self {
             inner: Arc::new(Inner {
                 sessions: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(1),
                 sink: Box::new(sink),
             }),
+        };
+        manager.spawn_monitor();
+        manager
+    }
+
+    /// Supervisor: detecta las sesiones calladas que esperan respuesta. Se
+    /// apaga solo cuando el gestor deja de existir.
+    fn spawn_monitor(&self) {
+        let weak: Weak<Inner> = Arc::downgrade(&self.inner);
+        let spawned = std::thread::Builder::new().name("nude-pty-monitor".into()).spawn(move || {
+            loop {
+                std::thread::sleep(MONITOR_INTERVAL);
+                let Some(inner) = weak.upgrade() else { return };
+                let sessions: Vec<(String, Arc<Session>)> =
+                    lock(&inner.sessions).iter().map(|(lane, s)| (lane.clone(), s.clone())).collect();
+                let now = Instant::now();
+                for (lane_id, session) in sessions {
+                    let change = lock(&session.activity).tick(now);
+                    if let Some(activity) = change {
+                        emit_activity(&inner, &lane_id, &session, activity);
+                    }
+                }
+            }
+        });
+        if let Err(e) = spawned {
+            eprintln!("nude: no se pudo supervisar los terminales: {e}");
         }
     }
 
@@ -338,6 +393,7 @@ impl PtyManager {
             killer: Mutex::new(child.clone_killer()),
             output: Mutex::new(Output::default()),
             exit: Mutex::new(None),
+            activity: Mutex::new(ActivityTracker::new()),
         });
         let previous = lock(&self.inner.sessions).insert(lane_id.to_owned(), session.clone());
         if let Some(previous) = previous {
@@ -368,6 +424,11 @@ impl PtyManager {
                         // Se emite con el historial bloqueado: un enganche
                         // simultáneo ve el trozo en el historial o en el evento.
                         (inner.sink)(PtyEvent::Output(&event));
+                        drop(output);
+                        let change = lock(&session.activity).on_output(&event.data, Instant::now());
+                        if let Some(activity) = change {
+                            emit_activity(&inner, &lane_id, &session, activity);
+                        }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break, // EIO en macOS al cerrarse el esclavo
@@ -388,8 +449,12 @@ impl PtyManager {
             // Ya nadie escribe: se libera el PTY (y el lector termina).
             lock(&session.writer).take();
             lock(&session.master).take();
-            let event = PtyExit { lane_id, session_id: session.id, exit_code: code };
+            let event = PtyExit { lane_id: lane_id.clone(), session_id: session.id, exit_code: code };
             (inner.sink)(PtyEvent::Exit(&event));
+            let change = lock(&session.activity).on_exit();
+            if let Some(activity) = change {
+                emit_activity(&inner, &lane_id, &session, activity);
+            }
         });
         if let Err(e) = spawned {
             eprintln!("nude: no se pudo vigilar el terminal del carril: {e}");
@@ -416,6 +481,7 @@ impl PtyManager {
     /// Lo que teclea el usuario (o pega) en el terminal.
     pub fn write(&self, lane_id: &str, data: &str) -> NudeResult<()> {
         let session = self.session(lane_id)?;
+        lock(&session.activity).on_input(data, Instant::now());
         let mut writer = lock(&session.writer);
         let writer = writer
             .as_mut()
@@ -456,6 +522,11 @@ impl PtyManager {
     }
 }
 
+fn emit_activity(inner: &Inner, lane_id: &str, session: &Session, activity: LaneActivity) {
+    let event = PtyActivityChange { lane_id: lane_id.to_owned(), session_id: session.id, program: session.program, activity };
+    (inner.sink)(PtyEvent::Status(&event));
+}
+
 /// `SIGHUP` al shell (que lo reenvía a sus trabajos) y cierre del PTY; si no
 /// muere en `KILL_GRACE`, `SIGKILL` en segundo plano.
 fn terminate(session: &Arc<Session>) {
@@ -486,7 +557,7 @@ fn terminate(session: &Arc<Session>) {
 }
 
 /// Shell de login del usuario (`$SHELL`), o `/bin/zsh` (el de macOS).
-fn login_shell() -> PathBuf {
+pub(crate) fn login_shell() -> PathBuf {
     std::env::var_os("SHELL")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute() && p.is_file())

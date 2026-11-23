@@ -5,8 +5,9 @@ import {
 } from "lucide-react";
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { UnifiedPatch, type Editors } from "./DiffInspector";
+import { ActivityDot, LaneAuditPanel } from "./LaneAudit";
 import {
-  agentLabels, cdCommand, copyText, errorMessage, openInEditor, tildePath,
+  activityLabels, agentLabels, cdCommand, copyText, errorMessage, openInEditor, tildePath,
   type AgentTool, type Lane, type LaneDiff, type Project, type Resource,
 } from "./workspace";
 
@@ -199,6 +200,12 @@ function LaneColumn({ lane, fresh, editors, onMerge, onDiscard, onNotice }: {
         <div className="lane-title">
           <h2 title={lane.name}>{lane.name}</h2>
           <span className="mono text-faint" title={lane.branchName}>{lane.branchName}</span>
+          {lane.terminal && (
+            <span className="lane-activity" data-activity={lane.terminal.activity} role="status">
+              <ActivityDot activity={lane.terminal.activity} />
+              {activityLabels[lane.terminal.activity]}
+            </span>
+          )}
         </div>
         <div className="lane-agent" data-agent={agent} data-live={activity?.attributable || undefined}>
           <span className="agent-dot" aria-hidden="true" />
@@ -228,7 +235,7 @@ function LaneColumn({ lane, fresh, editors, onMerge, onDiscard, onNotice }: {
       <div className="lane-tabs" role="tablist" aria-label={`Vista del carril ${lane.name}`}>
         <button role="tab" aria-selected={tab === "terminal"} onClick={() => setTab("terminal")}>
           <SquareTerminal size={12} aria-hidden="true" />Terminal
-          {lane.terminal?.running && <span className="tab-live" aria-label="en marcha" />}
+          {lane.terminal && <ActivityDot activity={lane.terminal.activity} />}
         </button>
         <button role="tab" aria-selected={tab === "changes"} onClick={() => setTab("changes")}>
           <FileDiffIcon size={12} aria-hidden="true" />Cambios ({lane.files.length})
@@ -271,6 +278,7 @@ function LaneColumn({ lane, fresh, editors, onMerge, onDiscard, onNotice }: {
               ))}
             </ul>
           )}
+          {lane.files.length > 0 && <LaneAuditPanel lane={lane} onSelectFile={setSelectedPath} />}
           <div className="lane-diff">
             {error ? <div className="inline-error" role="alert"><span>{error}</span></div>
               : selected ? (selected.patchText

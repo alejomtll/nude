@@ -7,6 +7,10 @@ mod pty;
 mod safety;
 mod watcher;
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use tauri::menu::{Menu, MenuItem, Submenu};
 use tauri::{AppHandle, Emitter, Manager, RunEvent};
 
@@ -43,6 +47,43 @@ fn notify_guardrail(app: &AppHandle, alert: &watcher::GuardrailAlert) {
     if let Err(e) = result {
         eprintln!("nude: no se pudo mostrar la notificación: {e}");
     }
+}
+
+/// Entre dos avisos del mismo carril pasa al menos esto.
+const LANE_NOTIFY_COOLDOWN: Duration = Duration::from_secs(20);
+
+/// Notificación discreta cuando un carril espera respuesta y Nude no tiene el
+/// foco. Devuelve `false` si no se mostró.
+fn notify_lane_attention(app: &AppHandle, change: &pty::PtyActivityChange) -> bool {
+    let focused = app
+        .get_webview_window("main")
+        .and_then(|window| window.is_focused().ok())
+        .unwrap_or(false);
+    if focused {
+        return false;
+    }
+    let Some(db) = app.try_state::<db::Database>() else { return false };
+    let Ok(Some(lane)) = db.get_lane(&change.lane_id) else { return false };
+    let project = db.get_project(&lane.project_id).ok().flatten().map(|p| p.name);
+    let who = match change.program {
+        pty::LaneProgram::Shell => "La terminal".to_owned(),
+        program => program.label().to_owned(),
+    };
+    let body = match project {
+        Some(project) => format!("Carril «{}» · {project}", lane.name),
+        None => format!("Carril «{}»", lane.name),
+    };
+    let result = app
+        .notification()
+        .builder()
+        .title(format!("{who} espera tu respuesta"))
+        .body(body)
+        .show();
+    if let Err(e) = result {
+        eprintln!("nude: no se pudo mostrar la notificación: {e}");
+        return false;
+    }
+    true
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -107,12 +148,24 @@ pub fn run() {
             app.manage(watcher::HomeDir(home));
             app.manage(commands::lanes::LaneRoot(data_dir.join("worktrees")));
 
-            // Terminales embebidas de los carriles: salida y fin como eventos.
+            // Terminales embebidas de los carriles: salida, estado en vivo y fin
+            // como eventos; aviso nativo si un carril espera respuesta.
             let handle = app.handle().clone();
+            let notified: Mutex<HashMap<String, Instant>> = Mutex::new(HashMap::new());
             app.manage(pty::PtyManager::new(move |event| {
                 let result = match event {
                     pty::PtyEvent::Output(output) => handle.emit(pty::EVENT_PTY_OUTPUT, output),
                     pty::PtyEvent::Exit(exit) => handle.emit(pty::EVENT_PTY_EXIT, exit),
+                    pty::PtyEvent::Status(change) => {
+                        if change.activity == pty::LaneActivity::NeedsAttention {
+                            let mut last = notified.lock().unwrap_or_else(|e| e.into_inner());
+                            let recent = last.get(&change.lane_id).is_some_and(|at| at.elapsed() < LANE_NOTIFY_COOLDOWN);
+                            if !recent && notify_lane_attention(&handle, change) {
+                                last.insert(change.lane_id.clone(), Instant::now());
+                            }
+                        }
+                        handle.emit(pty::EVENT_PTY_STATUS, change)
+                    }
                 };
                 if let Err(e) = result {
                     eprintln!("nude: no se pudo emitir la salida del terminal: {e}");
@@ -157,6 +210,7 @@ pub fn run() {
             commands::pty::write_lane_pty,
             commands::pty::resize_lane_pty,
             commands::pty::kill_lane_pty,
+            commands::audit::audit_parallel_lane,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

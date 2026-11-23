@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
 export interface Project {
   id: string;
@@ -580,12 +580,37 @@ export const programLabels: Record<LaneProgram, string> = {
   shell: "Shell",
 };
 
+/** Estado en vivo de la terminal del carril (`lane-pty-status`). */
+export type TerminalActivity = "working" | "needs_attention" | "exited";
+
+export const activityLabels: Record<TerminalActivity, string> = {
+  working: "Trabajando",
+  needs_attention: "Esperando respuesta",
+  exited: "Terminado",
+};
+
 export interface PtyStatus {
   sessionId: number;
   program: LaneProgram;
   running: boolean;
   exitCode: number | null;
   pid: number | null;
+  activity: TerminalActivity;
+}
+
+export interface PtyActivityChange {
+  laneId: string;
+  sessionId: number;
+  program: LaneProgram;
+  activity: TerminalActivity;
+}
+
+/** Estado agregado de varios carriles: el más urgente gana. */
+export function overallActivity(lanes: Lane[]): TerminalActivity | null {
+  const states = lanes.flatMap((lane) => lane.terminal ? [lane.terminal.activity] : []);
+  if (states.includes("needs_attention")) return "needs_attention";
+  if (states.includes("working")) return "working";
+  return states.length ? "exited" : null;
 }
 
 /** `spawn_lane_pty` / `attach_lane_pty`: estado + historial hasta `end`. */
@@ -640,6 +665,8 @@ export function useLanes(projectId: string | undefined, revision: number) {
   const [resource, setResource] = useState<Resource<Lane[]>>({});
   const [tick, setTick] = useState(0);
   const laneProjects = useRef(new Set<string>());
+  /** Sesión de terminal conocida por carril (para el estado en vivo). */
+  const sessions = useRef(new Map<string, number | null>());
 
   useEffect(() => {
     setResource({});
@@ -652,6 +679,7 @@ export function useLanes(projectId: string | undefined, revision: number) {
       (data) => {
         if (!active) return;
         laneProjects.current = new Set(data.flatMap((lane) => lane.laneProjectId ? [lane.laneProjectId] : []));
+        sessions.current = new Map(data.map((lane) => [lane.id, lane.terminal?.sessionId ?? null]));
         setResource({ data });
       },
       (error: unknown) => {
@@ -680,6 +708,20 @@ export function useLanes(projectId: string | undefined, revision: number) {
     };
     subscribe<string>("lanes-changed", (changed) => { if (changed === projectId) soon(); });
     subscribe<PtyExit>("lane-pty-exit", () => soon());
+    // Estado en vivo: se aplica al momento, sin volver a pedir los carriles.
+    subscribe<PtyActivityChange>("lane-pty-status", (change) => {
+      if (!sessions.current.has(change.laneId)) return; // carril de otro proyecto
+      if (sessions.current.get(change.laneId) !== change.sessionId) {
+        soon(); // sesión recién lanzada que la lista aún no conoce
+        return;
+      }
+      setResource((previous) => previous.data ? {
+        ...previous,
+        data: previous.data.map((lane) => lane.id === change.laneId && lane.terminal?.sessionId === change.sessionId
+          ? { ...lane, terminal: { ...lane.terminal, activity: change.activity, running: change.activity !== "exited" } }
+          : lane),
+      } : previous);
+    });
     subscribe<Checkpoint>("checkpoint-created", (checkpoint) => {
       if (laneProjects.current.has(checkpoint.projectId) || checkpoint.projectId === projectId) soon();
     });
@@ -724,3 +766,83 @@ export const cdCommand = (path: string) => `cd '${path.replace(/'/g, `'\\''`)}'`
 
 /** `/Users/nombre/...` → `~/...` */
 export const tildePath = (path: string) => path.replace(/^\/Users\/[^/]+/, "~");
+
+// ------------------------------------------------------ auditoría pre-merge
+
+export type AuditorCli = "auto" | "claude" | "codex";
+
+export const auditorLabels: Record<AuditorCli, string> = {
+  auto: "Auto",
+  claude: "Claude Code",
+  codex: "Codex",
+};
+
+export interface AuditFinding {
+  severity: "high" | "medium" | "low";
+  file: string | null;
+  message: string;
+}
+
+export interface AuditReport {
+  laneId: string;
+  auditor: Exclude<AuditorCli, "auto">;
+  summary: string;
+  verdict: "ready" | "review";
+  findings: AuditFinding[];
+  filesReviewed: number;
+  truncated: boolean;
+  durationMs: number;
+  /** Milisegundos Unix. */
+  createdAt: number;
+}
+
+export interface LaneAuditState {
+  running: boolean;
+  auditor: AuditorCli;
+  report?: AuditReport;
+  error?: string;
+  /** Huella de los cambios auditados: si cambia, el reporte queda viejo. */
+  fingerprint?: string;
+}
+
+/**
+ * Auditorías por carril compartidas entre la pestaña «Cambios» y el diálogo
+ * de «Aplicar»: lanzarla en un sitio la muestra en el otro.
+ */
+const audits = new Map<string, LaneAuditState>();
+const auditListeners = new Set<() => void>();
+const idleAudit: LaneAuditState = { running: false, auditor: "auto" };
+
+function setAudit(laneId: string, state: LaneAuditState) {
+  audits.set(laneId, state);
+  auditListeners.forEach((listener) => listener());
+}
+
+function subscribeAudits(listener: () => void) {
+  auditListeners.add(listener);
+  return () => { auditListeners.delete(listener); };
+}
+
+export async function runLaneAudit(laneId: string, auditor: AuditorCli, fingerprint: string) {
+  const previous = audits.get(laneId);
+  if (previous?.running) return;
+  setAudit(laneId, { running: true, auditor, report: previous?.report, fingerprint: previous?.fingerprint });
+  try {
+    const report = await invoke<AuditReport>("audit_parallel_lane", { laneId, auditorCli: auditor });
+    setAudit(laneId, { running: false, auditor, report, fingerprint });
+  } catch (reason) {
+    setAudit(laneId, { running: false, auditor, error: errorMessage(reason) });
+  }
+}
+
+export function setLaneAuditor(laneId: string, auditor: AuditorCli) {
+  setAudit(laneId, { ...(audits.get(laneId) ?? idleAudit), auditor });
+}
+
+/** Huella de lo que cambió en el carril (archivos y checkpoints). */
+export const laneFingerprint = (lane: Lane) =>
+  `${lane.checkpointCount}|${lane.lastCheckpointAt}|${lane.files.map((f) => f.changeType + f.filePath).join(",")}`;
+
+export function useLaneAudit(laneId: string) {
+  return useSyncExternalStore(subscribeAudits, () => audits.get(laneId) ?? idleAudit);
+}

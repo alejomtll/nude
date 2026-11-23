@@ -38,6 +38,9 @@ pub enum NudeError {
     #[error("terminal: {0}")]
     Pty(String),
 
+    #[error("{0}")]
+    Audit(String),
+
     #[error("la tarea en segundo plano falló: {0}")]
     Task(String),
 }

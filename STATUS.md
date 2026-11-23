@@ -1,7 +1,7 @@
 # Estado del proyecto Nude
 
 > Checklist vivo. Cada agente lo actualiza al terminar una tarea (ver AGENTS.md §5).
-> Última actualización: 2026-11-22 — Fase 8.1, terminal embebida por carril y apps nativas de agentes.
+> Última actualización: 2026-11-22 — Fase 9, supervisión activa de carriles y auditoría pre-merge local.
 
 ## Fase 1 — Backend base (Rust) ✅
 
@@ -445,3 +445,69 @@ Solo `src/`; `src-tauri/` sin cambios (IPC, eventos y comandos intactos).
   - Los archivos del mock se borraron después.
 - [ ] Probar en `Nude.app` con `claude` y `codex` reales (TUI a pantalla completa, redimensionado y `Detener`)
 
+## Fase 9 — Supervisión activa de carriles y auditoría pre-merge ✅
+
+### Estado en vivo de las terminales (`src-tauri/src/pty/activity.rs`)
+- [x] Cada sesión PTY tiene un detector puro (`ActivityTracker`) con tres estados:
+  - `working`: emite salida reciente;
+  - `needs_attention`: tras un bloque de salida lleva 3 s callada y sus últimas líneas, sin ANSI, parecen una pregunta, una confirmación o un prompt listo;
+  - `exited`: el proceso terminó.
+- [x] Heurística (`looks_like_waiting`):
+  - `strip_ansi` quita CSI, OSC, DCS y controles. Los saltos de cursor pasan a ser saltos de línea y los avances, espacios;
+  - marcas de espera: `(y/n)`, `Do you want`, `❯ 1. Yes`, `? for shortcuts`, `⏎ send`, `Esc to cancel`…;
+  - marcas de trabajo: `esc to interrupt`. Si aparecen ambas, gana la última que pintó la TUI;
+  - si no hay marcas, cuenta como espera que la última línea acabe en un prompt (`$`, `%`, `#`, `>`, `❯`, `›`, `➜`, `?`).
+- [x] Lo que el usuario teclea se registra (`write_lane_pty`). El eco que llega en menos de 350 ms (≤ 256 bytes) no cuenta como trabajo; tras Enter, todo lo que llegue sí cuenta.
+- [x] Un callado sin prompt (p. ej. una compilación larga) sigue en `working`. Cada bloque se evalúa una sola vez.
+- [x] Un hilo supervisor (cada 250 ms, se apaga al soltar el gestor) emite `lane-pty-status` (`{ laneId, sessionId, program, activity }`) solo cuando cambia. `PtyStatus` (`list_parallel_lanes`, `attach`) incluye `activity`.
+- [x] Notificación nativa (`tauri-plugin-notification`) al pasar a `needs_attention` si la ventana `main` no tiene el foco:
+  - título: «Claude Code espera tu respuesta»;
+  - cuerpo: «Carril «X» · proyecto»;
+  - como máximo una cada 20 s por carril.
+
+### Auditoría pre-merge (`src-tauri/src/commands/audit.rs`)
+- [x] `audit_parallel_lane({ laneId, auditorCli })`, con `auditorCli` = `claude`, `codex` o `auto` (por defecto):
+  - `auto` usa primero el agente del carril y, si no está instalado, el otro;
+  - toma `lane_diff`: commits del carril, cambios sin confirmar y archivos nuevos sin trackear, contra el ancestro común con la rama actual.
+- [x] Prompt en español:
+  - pide JSON estricto `{ summary, verdict: ready|review, findings[≤5]: { severity: high|medium|low, file, message } }`;
+  - incluye lista de archivos, archivos sensibles (`safety::sensitive_reason`), conflictos y diff;
+  - límites: 120 000 caracteres de diff y 24 000 por archivo (marca `truncated`); los binarios van sin parche.
+- [x] Ejecución con el shell de login (`$SHELL -l -i -c`), sin API keys propias, prompt por stdin y en una carpeta temporal vacía. Así la transcripción del auditor no se atribuye al agente del carril:
+  - `claude -p --permission-mode plan --output-format text --disallowedTools 'Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch'`;
+  - `codex exec --sandbox read-only --skip-git-repo-check --color never --output-last-message last.txt -`.
+- [x] Límite de 45 s: se mata el grupo de procesos entero y se devuelve un error claro. También hay errores limpios para binario ausente (exit 127, con cómo instalarlo), código ≠ 0 (última línea de stderr) y respuesta sin JSON. Corre en `spawn_blocking`.
+- [x] Parser tolerante (`parse_audit_response`):
+  - entrada: JSON directo, bloques markdown, objetos sueltos entre prosa (gana el último completo), comas finales y el envoltorio de `claude --output-format json`;
+  - normaliza sinónimos de severidad y veredicto;
+  - descarta hallazgos sin mensaje, ordena por severidad y recorta a 5;
+  - un hallazgo `high` fuerza `review`.
+
+### UI (`src/LaneAudit.tsx`, `src/ParallelView.tsx`, `src/App.tsx`)
+- [x] Indicador de estado:
+  - aparece en la cabecera de cada carril, en la pestaña Terminal, en la barra de la terminal y en el contador de la pestaña Paralelo (con el estado más urgente);
+  - verde = trabajando, ámbar pulsante = «Esperando respuesta» (respeta `prefers-reduced-motion`), neutro = terminado.
+- [x] `useLanes` aplica `lane-pty-status` al momento y solo vuelve a pedir la lista si la sesión es nueva.
+- [x] «Auditar cambios» (con selector Auto / Claude Code / Codex) en la pestaña **Cambios (N)**, justo encima del diff, y en el diálogo de **Aplicar a main**:
+  - el reporte se comparte entre ambos sitios;
+  - se marca como desactualizado si el carril cambia;
+  - pulsar el archivo de un hallazgo lo abre en el diff;
+  - estética monocroma: `#181818`, bordes `#262626`.
+
+### Verificación
+- [x] `cargo check --manifest-path src-tauri/Cargo.toml` sin errores ni avisos
+- [x] `cargo test --lib`. Nuevos:
+  - **detector**: `strip_ansi`, heurísticas de espera y trabajo, repintado de TUI (gana lo último), transición a `needs_attention` tras 3 s, eco frente a respuesta tras Enter, pegado grande y silencio sin prompt;
+  - **PTY real**: `working` → `needs_attention` (≥ 3 s) → `working` al responder `y` → `exited`;
+  - **parser**: JSON directo, markdown con prosa, llaves sueltas y esquema inválido antes, comas finales, envoltorio de Claude, normalización y límite de 5, rechazo sin reporte;
+  - **prompt**: archivos sensibles, conflictos, binarios y recorte;
+  - **ejecución con CLI falsos**: `claude -p` en modo `plan` con el prompt por stdin; `codex exec` en `read-only` donde gana `last.txt` sobre los logs; `auto` con respaldo; ninguno instalado; tiempo agotado (< 5 s con hijos en segundo plano); código de error con stderr; respuesta sin JSON.
+- [x] Flags comprobados con `claude --help` y `codex exec --help` de las versiones instaladas
+- [x] `npm run build` OK
+- [x] Revisado en el navegador con IPC simulado:
+  - indicadores en cabecera, pestaña y contador;
+  - cambios en vivo vía `lane-pty-status`;
+  - reporte en Cambios y en el diálogo de Aplicar;
+  - error de CLI ausente.
+  - Los archivos del mock se borraron después.
+- [ ] Probar en `Nude.app` con agentes reales: notificación con la ventana en segundo plano y auditoría real con `claude`/`codex`

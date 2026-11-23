@@ -4,6 +4,7 @@
 //! `spawn_blocking` para no congelar el hilo principal de la UI.
 
 // `generate_handler!` necesita la ruta real del módulo (no un re-export).
+pub mod audit;
 pub mod checkpoints;
 pub mod editor;
 pub mod git;
